@@ -1,0 +1,24 @@
+# Core dependencies for the API → Warehouse POC
+
+# Database
+duckdb>=0.9.0
+
+# HTTP client
+requests>=2.31.0
+
+# Data manipulation (optional but helpful)
+pandas>=2.0.0
+
+# Environment variables (for API keys)
+python-dotenv>=1.0.0
+
+# Rate limiting / retry logic
+tenacity>=8.2.0
+
+# Logging (stdlib is fine, but structlog is nice)
+# structlog>=23.0.0
+
+# Development
+# pytest>=7.0.0
+# black>=23.0.0
+# mypy>=1.0.0

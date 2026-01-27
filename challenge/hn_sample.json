@@ -1,0 +1,97 @@
+{
+  "_comment": "Sample responses from Hacker News API - https://hacker-news.firebaseio.com/v0/",
+
+  "topstories_endpoint": {
+    "_url": "https://hacker-news.firebaseio.com/v0/topstories.json",
+    "_description": "Returns up to 500 top story IDs",
+    "response": [39521234, 39518901, 39515678, 39512345, 39509012]
+  },
+
+  "item_endpoint_story": {
+    "_url": "https://hacker-news.firebaseio.com/v0/item/39521234.json",
+    "_description": "A story item",
+    "response": {
+      "by": "pg",
+      "descendants": 142,
+      "id": 39521234,
+      "kids": [39521456, 39521789, 39522012],
+      "score": 857,
+      "time": 1706140800,
+      "title": "Show HN: I built a tool to analyze datasets",
+      "type": "story",
+      "url": "https://example.com/dataset-tool"
+    }
+  },
+
+  "item_endpoint_comment": {
+    "_url": "https://hacker-news.firebaseio.com/v0/item/39521456.json",
+    "_description": "A comment item - note: comments can have nested kids (child comments)",
+    "response": {
+      "by": "commenter123",
+      "id": 39521456,
+      "kids": [39521500, 39521501],
+      "parent": 39521234,
+      "text": "This is really impressive! I've been looking for something like this. How does it handle missing values?",
+      "time": 1706141000,
+      "type": "comment"
+    }
+  },
+
+  "item_endpoint_comment_reply": {
+    "_url": "https://hacker-news.firebaseio.com/v0/item/39521500.json",
+    "_description": "A reply to a comment",
+    "response": {
+      "by": "pg",
+      "id": 39521500,
+      "parent": 39521456,
+      "text": "Thanks! It uses multiple imputation strategies depending on the data type.",
+      "time": 1706141200,
+      "type": "comment"
+    }
+  },
+
+  "user_endpoint": {
+    "_url": "https://hacker-news.firebaseio.com/v0/user/pg.json",
+    "_description": "User profile",
+    "response": {
+      "about": "Bug fixer.",
+      "created": 1160418111,
+      "id": "pg",
+      "karma": 157236,
+      "submitted": [39521234, 39500000, 39400000]
+    }
+  },
+
+  "item_types": {
+    "story": "A top-level submission with url or text",
+    "comment": "A comment on a story or another comment",
+    "job": "A job posting",
+    "poll": "A poll",
+    "pollopt": "A poll option"
+  },
+
+  "item_fields": {
+    "id": "The item's unique id (integer)",
+    "deleted": "true if the item is deleted (boolean)",
+    "type": "The type of item: job, story, comment, poll, or pollopt",
+    "by": "The username of the item's author",
+    "time": "Creation date of the item, Unix timestamp",
+    "text": "The comment, story or poll text (HTML)",
+    "dead": "true if the item is dead (boolean)",
+    "parent": "The comment's parent: either another comment or the story",
+    "poll": "The pollopt's associated poll",
+    "kids": "The ids of the item's comments, in ranked display order (array)",
+    "url": "The URL of the story",
+    "score": "The story's score, or the votes for a pollopt",
+    "title": "The title of the story, poll or job",
+    "parts": "A list of related pollopts, in display order",
+    "descendants": "Total comment count for stories and polls"
+  },
+
+  "notes": {
+    "rate_limits": "No official rate limit, but be respectful (1-2 requests/second recommended)",
+    "recursive_fetching": "To get all comments, recursively fetch items from the 'kids' array",
+    "deleted_items": "Some items may be deleted - handle gracefully",
+    "dead_items": "Some items may be 'dead' (flagged/killed) - still accessible but marked"
+  }
+}

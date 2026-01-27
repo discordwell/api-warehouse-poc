@@ -1,0 +1,107 @@
+{
+  "_comment": "Sample responses from FRED API - https://api.stlouisfed.org/fred/",
+
+  "series_endpoint": {
+    "_url": "https://api.stlouisfed.org/fred/series?series_id=UNRATE&api_key=YOUR_KEY&file_type=json",
+    "response": {
+      "realtime_start": "2024-01-01",
+      "realtime_end": "2024-01-01",
+      "seriess": [
+        {
+          "id": "UNRATE",
+          "realtime_start": "2024-01-01",
+          "realtime_end": "2024-01-01",
+          "title": "Unemployment Rate",
+          "observation_start": "1948-01-01",
+          "observation_end": "2023-12-01",
+          "frequency": "Monthly",
+          "frequency_short": "M",
+          "units": "Percent",
+          "units_short": "%",
+          "seasonal_adjustment": "Seasonally Adjusted",
+          "seasonal_adjustment_short": "SA",
+          "last_updated": "2024-01-05 08:01:03-06",
+          "popularity": 94,
+          "notes": "The unemployment rate represents the number of unemployed as a percentage of the labor force."
+        }
+      ]
+    }
+  },
+
+  "observations_endpoint": {
+    "_url": "https://api.stlouisfed.org/fred/series/observations?series_id=UNRATE&api_key=YOUR_KEY&file_type=json",
+    "response": {
+      "realtime_start": "2024-01-01",
+      "realtime_end": "2024-01-01",
+      "observation_start": "1776-07-04",
+      "observation_end": "9999-12-31",
+      "units": "lin",
+      "output_type": 1,
+      "file_type": "json",
+      "order_by": "observation_date",
+      "sort_order": "asc",
+      "count": 912,
+      "offset": 0,
+      "limit": 100000,
+      "observations": [
+        {
+          "realtime_start": "2024-01-01",
+          "realtime_end": "2024-01-01",
+          "date": "1948-01-01",
+          "value": "3.4"
+        },
+        {
+          "realtime_start": "2024-01-01",
+          "realtime_end": "2024-01-01",
+          "date": "1948-02-01",
+          "value": "3.8"
+        },
+        {
+          "realtime_start": "2024-01-01",
+          "realtime_end": "2024-01-01",
+          "date": "2023-11-01",
+          "value": "3.7"
+        },
+        {
+          "realtime_start": "2024-01-01",
+          "realtime_end": "2024-01-01",
+          "date": "2023-12-01",
+          "value": "3.7"
+        }
+      ]
+    }
+  },
+
+  "series_to_ingest": [
+    {
+      "series_id": "GDP",
+      "description": "Gross Domestic Product",
+      "frequency": "Quarterly",
+      "units": "Billions of Dollars"
+    },
+    {
+      "series_id": "UNRATE",
+      "description": "Unemployment Rate",
+      "frequency": "Monthly",
+      "units": "Percent"
+    },
+    {
+      "series_id": "CPIAUCSL",
+      "description": "Consumer Price Index for All Urban Consumers",
+      "frequency": "Monthly",
+      "units": "Index 1982-1984=100"
+    },
+    {
+      "series_id": "FEDFUNDS",
+      "description": "Federal Funds Effective Rate",
+      "frequency": "Monthly",
+      "units": "Percent"
+    }
+  ],
+
+  "notes": {
+    "rate_limits": "120 requests per minute",
+    "pagination": "Use limit and offset parameters for large result sets",
+    "date_filtering": "Use observation_start and observation_end to filter date range"
+  }
+}
