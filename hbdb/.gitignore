@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+venv/
+cockroach-data/
+*.log
+.DS_Store

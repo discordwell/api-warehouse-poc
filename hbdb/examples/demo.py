@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BadgerDB Demo - Distributed SQL with Deterministic Transactions
+HBDB Demo - Distributed SQL with Deterministic Transactions
 
 Demonstrates:
 1. Basic SQL operations (CREATE, INSERT, SELECT, UPDATE, DELETE)
@@ -12,19 +12,19 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from badgerdb.database import BadgerDB
-from badgerdb.config import Config
+from hbdb.database import HBDB
+from hbdb.config import Config
 
 
 def main():
     print("=" * 60)
-    print("BadgerDB Demo - Calvin-Style Deterministic Transactions")
+    print("HBDB Demo - Calvin-Style Deterministic Transactions")
     print("=" * 60)
 
     # Create database with default config
     config = Config(num_shards=4)
 
-    with BadgerDB(config) as db:
+    with HBDB(config) as db:
         print("\n1. CREATE TABLE")
         print("-" * 40)
         result = db.execute("""

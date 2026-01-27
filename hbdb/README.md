@@ -1,4 +1,4 @@
-# BadgerDB
+# HBDB
 
 A distributed SQL database with Calvin-style deterministic transactions.
 
@@ -20,9 +20,9 @@ A distributed SQL database with Calvin-style deterministic transactions.
 ## Quick Start
 
 ```python
-from badgerdb.database import BadgerDB
+from hbdb.database import HBDB
 
-with BadgerDB() as db:
+with HBDB() as db:
     # Create table
     db.execute("""
         CREATE TABLE users (
@@ -69,7 +69,7 @@ rows = db.query("SELECT * FROM users")
 
 ```
 ┌─────────────────────────────────────────────┐
-│                BadgerDB                      │
+│                HBDB                      │
 │                                             │
 │  ┌───────────────────────────────────────┐  │
 │  │              SQL Layer                │  │
@@ -117,8 +117,8 @@ Shard Distribution:  4.2% variance (excellent)
 ## Running Tests
 
 ```bash
-cd ~/Projects/badgerdb
-python tests/test_badgerdb.py
+cd ~/Projects/hbdb
+python tests/test_hbdb.py
 ```
 
 ## Running Benchmark

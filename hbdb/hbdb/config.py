@@ -1,5 +1,5 @@
 """
-BadgerDB Configuration
+HBDB Configuration
 """
 
 from dataclasses import dataclass
@@ -8,7 +8,7 @@ from typing import Optional
 
 @dataclass
 class Config:
-    """Configuration for BadgerDB cluster."""
+    """Configuration for HBDB cluster."""
 
     # Cluster
     num_shards: int = 4

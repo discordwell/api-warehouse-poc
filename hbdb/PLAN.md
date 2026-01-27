@@ -1,4 +1,4 @@
-# BadgerDB: A Better CockroachDB
+# HBDB: A Better CockroachDB
 
 ## Overview
 
@@ -62,7 +62,7 @@ A distributed SQL database combining the best ideas:
 
 ### 1. Disaggregated Compute/Storage
 ```
-CockroachDB:                    BadgerDB:
+CockroachDB:                    HBDB:
 ┌─────────────┐                 ┌─────────────┐
 │   Node 1    │                 │  Compute 1  │ ← Stateless
 │ SQL+Storage │                 │  Compute 2  │    Scale independently
@@ -80,7 +80,7 @@ Benefit: Scale compute and storage independently
 
 ### 2. Deterministic Transactions (Calvin)
 ```
-CockroachDB:                    BadgerDB:
+CockroachDB:                    HBDB:
 
 Txn arrives → Execute →         Txn arrives → Sequence FIRST
               Lock →                           │
@@ -99,7 +99,7 @@ Benefit: No distributed locking during execution
 ```
 CockroachDB: Raft per range (leader bottleneck)
 
-BadgerDB:
+HBDB:
   - Sequencer uses Raft (but only for ordering, lightweight)
   - Storage uses quorum writes (simpler than full consensus)
   - Reads go to any replica (MVCC makes this safe)
@@ -146,8 +146,8 @@ BadgerDB:
 ## File Structure
 
 ```
-badgerdb/
-├── badgerdb/
+hbdb/
+├── hbdb/
 │   ├── __init__.py
 │   ├── types.py           # Core types (Timestamp, Key, TxnId, etc.)
 │   ├── config.py          # Configuration
@@ -260,7 +260,7 @@ badgerdb/
 
 ## Performance Targets
 
-| Metric | CockroachDB | BadgerDB Target |
+| Metric | CockroachDB | HBDB Target |
 |--------|-------------|-----------------|
 | Write latency | 5-15ms | 3-8ms |
 | Read latency | 2-5ms | 1-3ms |

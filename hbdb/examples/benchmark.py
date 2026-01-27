@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BadgerDB Benchmark
+HBDB Benchmark
 
 Measures throughput for various operations.
 """
@@ -13,8 +13,8 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from badgerdb.database import BadgerDB
-from badgerdb.config import Config
+from hbdb.database import HBDB
+from hbdb.config import Config
 
 
 def benchmark_sequential_writes(db, num_ops):
@@ -118,7 +118,7 @@ def benchmark_mixed_workload(db, num_ops, read_ratio=0.8):
 
 def main():
     print("=" * 70)
-    print("BadgerDB Benchmark - Calvin-Style Deterministic Transaction Throughput")
+    print("HBDB Benchmark - Calvin-Style Deterministic Transaction Throughput")
     print("=" * 70)
     print()
 
@@ -127,49 +127,49 @@ def main():
     # Sequential writes
     print("1. Sequential Writes (1000 ops)")
     print("-" * 50)
-    with BadgerDB(config) as db:
+    with HBDB(config) as db:
         ops_per_sec = benchmark_sequential_writes(db, 1000)
     print(f"   Throughput: {ops_per_sec:,.0f} ops/sec")
 
     # Sequential reads
     print("\n2. Sequential Reads (1000 ops)")
     print("-" * 50)
-    with BadgerDB(config) as db:
+    with HBDB(config) as db:
         ops_per_sec = benchmark_sequential_reads(db, 1000)
     print(f"   Throughput: {ops_per_sec:,.0f} ops/sec")
 
     # Concurrent writes
     print("\n3. Concurrent Writes (1000 ops, 10 workers)")
     print("-" * 50)
-    with BadgerDB(config) as db:
+    with HBDB(config) as db:
         ops_per_sec = benchmark_concurrent_writes(db, 1000, 10)
     print(f"   Throughput: {ops_per_sec:,.0f} ops/sec")
 
     # Concurrent reads
     print("\n4. Concurrent Reads (1000 ops, 10 workers)")
     print("-" * 50)
-    with BadgerDB(config) as db:
+    with HBDB(config) as db:
         ops_per_sec = benchmark_concurrent_reads(db, 1000, 10)
     print(f"   Throughput: {ops_per_sec:,.0f} ops/sec")
 
     # Mixed workload
     print("\n5. Mixed Workload (80% reads, 20% writes, 1000 ops)")
     print("-" * 50)
-    with BadgerDB(config) as db:
+    with HBDB(config) as db:
         ops_per_sec, reads, writes = benchmark_mixed_workload(db, 1000, 0.8)
     print(f"   Throughput: {ops_per_sec:,.0f} ops/sec ({reads} reads, {writes} writes)")
 
     # Larger scale
     print("\n6. Large Scale Sequential Writes (5000 ops)")
     print("-" * 50)
-    with BadgerDB(config) as db:
+    with HBDB(config) as db:
         ops_per_sec = benchmark_sequential_writes(db, 5000)
     print(f"   Throughput: {ops_per_sec:,.0f} ops/sec")
 
     # Sharding efficiency
     print("\n7. Shard Distribution Analysis")
     print("-" * 50)
-    with BadgerDB(Config(num_shards=8)) as db:
+    with HBDB(Config(num_shards=8)) as db:
         db.execute("CREATE TABLE shard_test (id INTEGER PRIMARY KEY, data TEXT)")
         for i in range(1000):
             db.execute(f"INSERT INTO shard_test (id, data) VALUES ({i}, 'data')")

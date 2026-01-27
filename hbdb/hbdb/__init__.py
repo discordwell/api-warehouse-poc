@@ -1,5 +1,5 @@
 """
-BadgerDB - A distributed SQL database with deterministic transactions
+HBDB - A distributed SQL database with deterministic transactions
 
 Key innovations over CockroachDB:
 - Disaggregated compute/storage (Aurora-style)

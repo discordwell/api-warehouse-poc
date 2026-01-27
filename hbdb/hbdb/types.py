@@ -1,5 +1,5 @@
 """
-Core types for BadgerDB
+Core types for HBDB
 """
 
 from __future__ import annotations

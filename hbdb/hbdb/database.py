@@ -1,5 +1,5 @@
 """
-BadgerDB - Main Database Interface
+HBDB - Main Database Interface
 
 Ties together all components into a simple interface.
 """
@@ -17,12 +17,12 @@ from .sql.executor import QueryResult
 from .txn import TransactionManager, CalvinExecutor
 
 
-class BadgerDB:
+class HBDB:
     """
-    BadgerDB - A distributed SQL database with deterministic transactions.
+    HBDB - A distributed SQL database with deterministic transactions.
 
     Usage:
-        db = BadgerDB()
+        db = HBDB()
         db.start()
 
         db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")

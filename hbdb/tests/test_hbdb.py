@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BadgerDB Test Suite
+HBDB Test Suite
 
 Tests all components of the distributed SQL database.
 """
@@ -13,9 +13,9 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from badgerdb.database import BadgerDB
-from badgerdb.config import Config
-from badgerdb.types import Timestamp, TxnId, ReadWriteSet
+from hbdb.database import HBDB
+from hbdb.config import Config
+from hbdb.types import Timestamp, TxnId, ReadWriteSet
 
 
 def test_timestamp():
@@ -92,7 +92,7 @@ def test_create_table():
     """Test CREATE TABLE."""
     print("Testing CREATE TABLE...")
 
-    with BadgerDB() as db:
+    with HBDB() as db:
         result = db.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
         assert result.success, f"CREATE TABLE failed: {result.error}"
 
@@ -107,7 +107,7 @@ def test_insert_select():
     """Test INSERT and SELECT."""
     print("Testing INSERT and SELECT...")
 
-    with BadgerDB() as db:
+    with HBDB() as db:
         db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
 
         # Insert
@@ -133,7 +133,7 @@ def test_update():
     """Test UPDATE."""
     print("Testing UPDATE...")
 
-    with BadgerDB() as db:
+    with HBDB() as db:
         db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, count INTEGER)")
         db.execute("INSERT INTO items (id, count) VALUES (1, 10)")
 
@@ -152,7 +152,7 @@ def test_delete():
     """Test DELETE."""
     print("Testing DELETE...")
 
-    with BadgerDB() as db:
+    with HBDB() as db:
         db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
         db.execute("INSERT INTO items (id) VALUES (1)")
         db.execute("INSERT INTO items (id) VALUES (2)")
@@ -173,7 +173,7 @@ def test_drop_table():
     """Test DROP TABLE."""
     print("Testing DROP TABLE...")
 
-    with BadgerDB() as db:
+    with HBDB() as db:
         db.execute("CREATE TABLE temp (id INTEGER PRIMARY KEY)")
         db.execute("INSERT INTO temp (id) VALUES (1)")
 
@@ -191,7 +191,7 @@ def test_multiple_inserts():
     """Test multiple sequential inserts."""
     print("Testing multiple inserts...")
 
-    with BadgerDB() as db:
+    with HBDB() as db:
         db.execute("CREATE TABLE numbers (id INTEGER PRIMARY KEY, value INTEGER)")
 
         for i in range(100):
@@ -208,7 +208,7 @@ def test_concurrent_reads():
     """Test concurrent read operations."""
     print("Testing concurrent reads...")
 
-    with BadgerDB() as db:
+    with HBDB() as db:
         db.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT)")
 
         for i in range(10):
@@ -232,7 +232,7 @@ def test_concurrent_writes():
     """Test concurrent write operations (deterministic ordering)."""
     print("Testing concurrent writes...")
 
-    with BadgerDB(Config(num_shards=4)) as db:
+    with HBDB(Config(num_shards=4)) as db:
         db.execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, count INTEGER)")
         db.execute("INSERT INTO counter (id, count) VALUES (1, 0)")
 
@@ -257,7 +257,7 @@ def test_sharding():
     """Test that data is distributed across shards."""
     print("Testing sharding...")
 
-    with BadgerDB(Config(num_shards=4)) as db:
+    with HBDB(Config(num_shards=4)) as db:
         db.execute("CREATE TABLE distributed (id INTEGER PRIMARY KEY)")
 
         for i in range(100):
@@ -277,7 +277,7 @@ def test_convenience_methods():
     """Test high-level convenience methods."""
     print("Testing convenience methods...")
 
-    with BadgerDB() as db:
+    with HBDB() as db:
         db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
 
         # insert()
@@ -311,7 +311,7 @@ def test_query_convenience():
     """Test query() method that raises on error."""
     print("Testing query() method...")
 
-    with BadgerDB() as db:
+    with HBDB() as db:
         db.execute("CREATE TABLE simple (id INTEGER PRIMARY KEY)")
         db.execute("INSERT INTO simple (id) VALUES (42)")
 
@@ -333,7 +333,7 @@ def test_database_not_started():
     """Test error when database not started."""
     print("Testing database not started error...")
 
-    db = BadgerDB()  # Don't start it
+    db = HBDB()  # Don't start it
 
     result = db.execute("SELECT 1")
     assert not result.success
@@ -346,7 +346,7 @@ def test_duplicate_primary_key():
     """Test duplicate primary key error."""
     print("Testing duplicate primary key...")
 
-    with BadgerDB() as db:
+    with HBDB() as db:
         db.execute("CREATE TABLE unique_test (id INTEGER PRIMARY KEY)")
         db.execute("INSERT INTO unique_test (id) VALUES (1)")
 
@@ -360,7 +360,7 @@ def test_duplicate_primary_key():
 def run_all_tests():
     """Run all tests."""
     print("=" * 60)
-    print("BadgerDB Test Suite")
+    print("HBDB Test Suite")
     print("=" * 60)
     print()
 

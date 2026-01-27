@@ -1,4 +1,4 @@
-# BadgerDB v2 - Sophisticated Distributed SQL
+# HBDB v2 - Sophisticated Distributed SQL
 
 ## Architecture Overview
 
@@ -151,7 +151,7 @@ Benefits:
 
 ## Comparison with CockroachDB
 
-| Aspect | CockroachDB | BadgerDB v2 |
+| Aspect | CockroachDB | HBDB v2 |
 |--------|-------------|-------------|
 | Sequencing | None (optimistic) | Parallel partitioned |
 | Conflicts | Retry (waste work) | Aria reorder (no waste) |
