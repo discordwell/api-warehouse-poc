@@ -17,6 +17,7 @@ class Transaction:
         self._write_buffer: Dict[str, Any] = {} # Buffer writes
         
         self._read_set: Set[str] = set()
+        self._read_ranges: List[Tuple[str, str]] = [] # Track scanned ranges
         self._write_set: Set[str] = set()
         
         self.started = False
@@ -58,6 +59,9 @@ class Transaction:
         """Range scan [start, end). WARNING: Merging writes is complex. Ignoring rights for now."""
         if not self.started: self.begin()
         
+        # Track range read for conflict detection
+        self._read_ranges.append((start_key, end_key))
+
         # Read from backend
         data = self.backend.scan(start_key, end_key, self.read_ts)
         
@@ -82,7 +86,7 @@ class Transaction:
         
         # 1. Ask Resolver
         success, commit_ts = self.resolver.commit(
-            self.read_ts, self._read_set, self._write_set
+            self.read_ts, self._read_set, self._read_ranges, self._write_set
         )
         
         if not success:
@@ -90,8 +94,13 @@ class Transaction:
             return False
         
         self.commit_ts = commit_ts
+
+        # 2. Durabiltiy (Write-Ahead Log)
+        # Must persist to disk before acknowledging commit
+        from .sequencer import get_sequencer
+        get_sequencer().append(self.commit_ts, self._write_buffer)
         
-        # 2. Apply writes to storage (async in real system, sync here)
+        # 3. Apply writes to storage (async in real system, sync here)
         for key, val in self._write_buffer.items():
             self.backend.write(key, val, self.commit_ts)
             

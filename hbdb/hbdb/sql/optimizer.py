@@ -127,7 +127,10 @@ class Optimizer:
                     for idx in indexes:
                         if idx.column_name == col:
                             # Mark for index scan (metadata flag)
-                            child.use_index = idx
+                            child.index_id = idx.id
+                            # Evaluate literal value
+                            val = cond.right.this if hasattr(cond.right, 'this') else str(cond.right)
+                            child.lookup_value = val
                             return node
         return node
 

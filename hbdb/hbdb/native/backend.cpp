@@ -1,0 +1,187 @@
+#include <algorithm>
+#include <map>
+#include <mutex>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <string>
+#include <vector>
+
+namespace py = pybind11;
+
+struct VersionedValue {
+  uint64_t ts;
+  py::object value; // Store Python object directly
+};
+
+#include <fstream>
+#include <iostream>
+
+class NativeBackend {
+public:
+  NativeBackend() {}
+
+  void write(const std::string &key, py::object value, uint64_t ts) {
+    std::lock_guard<std::mutex> lock(mtx);
+    store[key].push_back({ts, value});
+  }
+
+  py::object read(const std::string &key, uint64_t read_ts) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = store.find(key);
+    if (it == store.end())
+      return py::none();
+
+    const auto &versions = it->second;
+    // Find latest version <= read_ts
+    // Versions are appended in order, so we can search backwards
+    for (auto rit = versions.rbegin(); rit != versions.rend(); ++rit) {
+      if (rit->ts <= read_ts) {
+        return rit->value;
+      }
+    }
+    return py::none();
+  }
+
+  std::vector<std::pair<std::string, py::object>>
+  scan(const std::string &start, const std::string &end, uint64_t read_ts) {
+    std::lock_guard<std::mutex> lock(mtx);
+    std::vector<std::pair<std::string, py::object>> result;
+
+    auto it = store.lower_bound(start);
+    while (it != store.end()) {
+      if (it->first >= end)
+        break;
+
+      const auto &versions = it->second;
+      // Find visible version
+      for (auto rit = versions.rbegin(); rit != versions.rend(); ++rit) {
+        if (rit->ts <= read_ts) {
+          result.push_back({it->first, rit->value});
+          break;
+        }
+      }
+
+      it++;
+    }
+    return result;
+  }
+
+  // Snapshot Format:
+  // [Magic:4][Version:4][NumKeys:8]
+  // Foreach Key:
+  //   [KeyLen:4][KeyBytes...]
+  //   [NumVers:4]
+  //   Foreach Ver:
+  //     [TS:8]
+  //     [ValLen:4][ValPickledBytes...]
+
+  void save_snapshot(const std::string &path) {
+    std::lock_guard<std::mutex> lock(mtx);
+    std::ofstream out(path, std::ios::binary);
+    if (!out)
+      throw std::runtime_error("Cannot open file for snapshot");
+
+    const char magic[] = "HBDB";
+    uint32_t version = 1;
+    uint64_t num_keys = store.size();
+
+    out.write(magic, 4);
+    out.write(reinterpret_cast<char *>(&version), 4);
+    out.write(reinterpret_cast<char *>(&num_keys), 8);
+
+    py::object dumps = py::module::import("pickle").attr("dumps");
+
+    for (const auto &kv : store) {
+      const std::string &key = kv.first;
+      const auto &versions = kv.second;
+
+      uint32_t klen = key.size();
+      out.write(reinterpret_cast<char *>(&klen), 4);
+      out.write(key.data(), klen);
+
+      uint32_t nver = versions.size();
+      out.write(reinterpret_cast<char *>(&nver), 4);
+
+      for (const auto &v : versions) {
+        out.write(reinterpret_cast<const char *>(&v.ts), 8);
+
+        // Serialize value using Python pickle
+        py::bytes bytes = dumps(v.value);
+        std::string s_bytes = bytes; // Copy to C++ string
+        uint32_t vlen = s_bytes.size();
+
+        out.write(reinterpret_cast<char *>(&vlen), 4);
+        out.write(s_bytes.data(), vlen);
+      }
+    }
+    out.close();
+  }
+
+  uint64_t load_snapshot(const std::string &path) {
+    std::lock_guard<std::mutex> lock(mtx);
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+      throw std::runtime_error("Cannot open snapshot file");
+
+    char magic[5] = {0};
+    in.read(magic, 4);
+    if (std::string(magic) != "HBDB")
+      throw std::runtime_error("Invalid snapshot magic");
+
+    uint32_t version;
+    in.read(reinterpret_cast<char *>(&version), 4);
+
+    uint64_t num_keys;
+    in.read(reinterpret_cast<char *>(&num_keys), 8);
+
+    store.clear();
+
+    uint64_t max_ts = 0;
+
+    py::object loads = py::module::import("pickle").attr("loads");
+
+    for (uint64_t i = 0; i < num_keys; ++i) {
+      uint32_t klen;
+      in.read(reinterpret_cast<char *>(&klen), 4);
+      std::string key(klen, '\0');
+      in.read(&key[0], klen);
+
+      uint32_t nver;
+      in.read(reinterpret_cast<char *>(&nver), 4);
+
+      std::vector<VersionedValue> &versions = store[key];
+      versions.reserve(nver);
+
+      for (uint32_t j = 0; j < nver; ++j) {
+        uint64_t ts;
+        in.read(reinterpret_cast<char *>(&ts), 8);
+        if (ts > max_ts)
+          max_ts = ts;
+
+        uint32_t vlen;
+        in.read(reinterpret_cast<char *>(&vlen), 4);
+        std::string vbytes(vlen, '\0');
+        in.read(&vbytes[0], vlen);
+
+        // Deserialize
+        py::object val = loads(py::bytes(vbytes));
+        versions.push_back({ts, val});
+      }
+    }
+    return max_ts;
+  }
+
+private:
+  std::mutex mtx;
+  std::map<std::string, std::vector<VersionedValue>> store;
+};
+
+void init_backend(py::module &m) {
+  py::class_<NativeBackend>(m, "NativeBackend")
+      .def(py::init<>())
+      .def("write", &NativeBackend::write)
+      .def("read", &NativeBackend::read)
+      .def("scan", &NativeBackend::scan)
+      .def("save_snapshot", &NativeBackend::save_snapshot)
+      .def("load_snapshot", &NativeBackend::load_snapshot);
+}

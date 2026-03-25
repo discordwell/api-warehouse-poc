@@ -11,6 +11,8 @@ class LogicalNode:
 class LogicalScan(LogicalNode):
     table_name: str
     table_id: int
+    index_id: Optional[int] = None
+    lookup_value: Any = None
 
 @dataclass
 class LogicalFilter(LogicalNode):
@@ -47,3 +49,14 @@ class LogicalJoin(LogicalNode):
     right: 'LogicalNode'
     join_type: str  # INNER, LEFT, etc.
     condition: Any  # ON clause
+
+@dataclass
+class LogicalCreateTable(LogicalNode):
+    table_name: str
+    columns: List[Any] # List[Column]
+
+@dataclass
+class LogicalCreateIndex(LogicalNode):
+    index_name: str
+    table_name: str
+    column_name: str

@@ -348,9 +348,12 @@ class IndexScanExecutor(PhysicalOperator):
 def build_physical_plan(ctx: ExecutionContext, logical: LogicalNode, catalog=None) -> PhysicalOperator:
     if isinstance(logical, LogicalScan):
         # Check if index scan is possible
-        if hasattr(logical, 'use_index') and logical.use_index:
-            # Would need lookup value from parent Filter - for now use table scan
-            pass
+        if logical.index_id is not None and catalog:
+            # Find the specific index object
+            indexes = catalog.get_indexes_for_table(logical.table_id)
+            target_idx = next((idx for idx in indexes if idx.id == logical.index_id), None)
+            if target_idx:
+                return IndexScanExecutor(ctx, logical, target_idx, logical.lookup_value)
         return TableScanExecutor(ctx, logical)
     elif isinstance(logical, LogicalFilter):
         return FilterExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)

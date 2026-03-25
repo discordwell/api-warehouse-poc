@@ -3,7 +3,8 @@ from sqlglot import exp
 from typing import Any, Dict, List
 from .catalog import Catalog
 from .plan import (LogicalNode, LogicalScan, LogicalFilter, LogicalProject, 
-                   LogicalInsert, LogicalUpdate, LogicalDelete, LogicalJoin)
+                   LogicalInsert, LogicalUpdate, LogicalDelete, LogicalJoin,
+                   LogicalCreateTable, LogicalCreateIndex)
 from .types import Schema, Column
 
 class SQLParser:
@@ -21,8 +22,85 @@ class SQLParser:
             return self._bind_update(parsed)
         elif isinstance(parsed, exp.Delete):
             return self._bind_delete(parsed)
+        elif isinstance(parsed, exp.Create):
+            return self._bind_create(parsed)
         else:
             raise ValueError(f"Unsupported statement: {parsed.key}")
+
+    def _bind_create(self, node: exp.Create) -> LogicalNode:
+        kind = node.args.get("kind")
+        if kind == "TABLE":
+            return self._bind_create_table(node)
+        elif kind == "INDEX":
+            return self._bind_create_index(node)
+        else:
+            raise ValueError(f"Unsupported CREATE kind: {kind}")
+
+    def _bind_create_table(self, node: exp.Create) -> LogicalNode:
+        table_exp = node.this
+        table_name = table_exp.this.name
+        
+        # Parse columns
+        # sqlglot structures create table columns in node.this.expressions? No, node.this is Schema usually
+        schema_node = node.this
+        if not isinstance(schema_node, exp.Schema):
+             # Try finding schema in expressions if not directly there
+             pass
+
+        cols = []
+        from .types import Column, DataType
+        
+        # For 'CREATE TABLE x (id INT, name TEXT)'
+        # node.this is a Schema object
+        for col_def in schema_node.expressions:
+            if isinstance(col_def, exp.ColumnDef):
+                col_name = col_def.this.name
+                col_type_str = col_def.kind.this.name.upper()
+                col_pk = False
+                
+                # Check for constraints (PRIMARY KEY)
+                for constraint in col_def.args.get("constraints", []):
+                    if isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint):
+                        col_pk = True
+
+                # Map type
+                dtype = DataType.STRING
+                if col_type_str in ("INT", "INTEGER"): dtype = DataType.INTEGER
+                elif col_type_str == "TEXT": dtype = DataType.STRING
+                elif col_type_str == "REAL": dtype = DataType.FLOAT
+                elif col_type_str == "BOOLEAN": dtype = DataType.BOOLEAN
+                
+                cols.append(Column(name=col_name, type=dtype, primary_key=col_pk))
+        
+        return LogicalCreateTable(children=[], schema=None, table_name=table_name, columns=cols)
+
+    def _bind_create_index(self, node: exp.Create) -> LogicalNode:
+        # CREATE INDEX idx ON users (age)
+        index_name = node.this.name # "idx"
+        
+        # Table is usually in properties or findable
+        # sqlglot: node.this is the index name.
+        # Check 'properties' or args
+        # Example: CREATE INDEX x ON y (z)
+        # properties: IndexParameters
+        
+        # Actually sqlglot parse tree for CREATE INDEX is complex.
+        # Let's inspect node.args
+        pass 
+        # Debugging sqlglot structure is hard without running it. 
+        # Attempt standard structure:
+        table_exp = node.find(exp.Table)
+        table_name = table_exp.name
+        
+        # Columns?
+        # Usually inside the IndexParameters or just expressions?
+        # Let's look for identifiers or columns
+        cols = [c.name for c in node.find_all(exp.Column)]
+        if not cols:
+             # Might be Identifiers
+             cols = [c.name for c in node.find_all(exp.Identifier) if c.name != index_name and c.name != table_name]
+
+        return LogicalCreateIndex(children=[], schema=None, index_name=index_name, table_name=table_name, column_name=cols[0])
 
     def _bind_select(self, node: exp.Select) -> LogicalNode:
         # Check for JOINs
