@@ -88,9 +88,8 @@ class VersionedKVStore:
     def load_snapshot(self, path: str) -> int:
         if self._use_native:
             max_ts = self._native.load_snapshot(path)
-            # Rebuild Bloom Filter
-            self._bloom = get_bloom_filter()
-            # We need to iterate all keys to add to bloom.
+            # Rebuild Bloom Filter from the restored keyspace
+            self._bloom.reset()
             all_data = self._native.scan("", "\xFF", 18446744073709551615)
             for k, _ in all_data:
                 self._bloom.add(k)

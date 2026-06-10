@@ -46,6 +46,11 @@ class TableBloomFilter:
         with self._lock:
             return table_prefix in self._filters
 
+    def reset(self):
+        """Drop all filters (used when rebuilding from a snapshot)."""
+        with self._lock:
+            self._filters.clear()
+
 # Global bloom filter instance
 _bloom_filter = TableBloomFilter()
 

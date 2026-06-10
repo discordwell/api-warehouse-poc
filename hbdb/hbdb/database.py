@@ -12,8 +12,8 @@ from .config import Config
 from .types import Timestamp, TxnId
 from .storage import ShardManager
 from .sequencer import Sequencer
-from .sql import SQLParser, Executor, Schema
-from .sql.executor import QueryResult
+from .sql.schema import Schema
+from .sql.legacy.executor import QueryResult
 from .txn import TransactionManager, CalvinExecutor
 
 

@@ -4,3 +4,14 @@ venv/
 cockroach-data/
 *.log
 .DS_Store
+
+# Native extension build artifacts
+build/
+*.so
+
+# Runtime state (WAL, snapshots, chaos-test ground truth)
+snapshot.bin
+snapshot.bin.tmp
+transaction.log.archive.*
+truth.txt
+truth.txt.tmp

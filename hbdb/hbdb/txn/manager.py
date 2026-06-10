@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from ..types import Transaction, TxnId, TxnStatus, Operation, ReadWriteSet, Timestamp
 from ..sequencer import Sequencer
 from ..storage import ShardManager
-from ..sql.parser import SQLParser, Statement, SelectStmt, InsertStmt, UpdateStmt, DeleteStmt
+from ..sql.legacy.parser import SQLParser, Statement, SelectStmt, InsertStmt, UpdateStmt, DeleteStmt
 
 
 @dataclass

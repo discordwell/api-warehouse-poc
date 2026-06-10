@@ -60,30 +60,36 @@ class HBDB:
 
         print(f"[HBDB] Replaying WAL from {log_path}...")
         count = 0
-        
+        skipped = 0
+
         with open(log_path, "r") as f:
             for line in f:
                 try:
                     entry = json.loads(line)
                     ts = entry["ts"]
-                    
-                    if ts <= max_ts:
-                        continue # Skip already snapshotted
-                        
                     ops = entry["ops"]
-                    
-                    # Apply to backend
-                    for k, v in ops.items():
-                        self.backend.write(k, v, ts)
-                        
-                    if ts > max_ts: max_ts = ts
-                    count += 1
-                except:
-                    continue  # Skip corrupted lines
-        
+                    if not isinstance(ts, int) or not isinstance(ops, dict):
+                        raise TypeError("malformed WAL entry")
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    # A torn final line is expected after a crash mid-append;
+                    # anything else corrupt is skipped but counted.
+                    skipped += 1
+                    continue
+
+                if ts <= max_ts:
+                    continue # Skip already snapshotted
+
+                # Apply to backend
+                for k, v in ops.items():
+                    self.backend.write(k, v, ts)
+
+                max_ts = ts
+                count += 1
+
         # Restore Clock again in case log moved it forward
         self.resolver.restore_clock(max_ts)
-        print(f"[HBDB] Replayed {count} transactions from WAL. Clock at {max_ts}.")
+        suffix = f" ({skipped} corrupt lines skipped)" if skipped else ""
+        print(f"[HBDB] Replayed {count} transactions from WAL. Clock at {max_ts}.{suffix}")
 
     def take_snapshot(self):
         """

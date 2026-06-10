@@ -1,6 +1,18 @@
 # HBDB
 
-A distributed SQL database with Calvin-style deterministic transactions.
+A distributed SQL database POC. The codebase hosts two engines that share
+storage/SQL building blocks:
+
+1. **Calvin engine** (`hbdb.database.HBDB`) — deterministic transactions:
+   global ordering via a sequencer, then coordination-free execution.
+   Documented below and in `ARCHITECTURE.md`.
+2. **FDB-style engine** (`hbdb.db.HBDB`) — FoundationDB-style unbundled
+   architecture: optimistic interactive transactions validated by a
+   Resolver (C++ native extension with pure-Python fallback), WAL + binary
+   snapshot durability, and an optional TCP coordinator/storage cluster
+   (`hbdb.server.main`, `hbdb.cli`). Read-only transactions serialize at
+   their read timestamp; read-write transactions get OCC validation with
+   range (phantom) protection.
 
 ## Key Innovations (vs CockroachDB)
 
@@ -117,8 +129,28 @@ Shard Distribution:  4.2% variance (excellent)
 ## Running Tests
 
 ```bash
-cd ~/Projects/hbdb
+# (optional) build the C++ native extension; everything falls back to
+# pure Python without it
+python setup.py build_ext --inplace
+
+# Calvin engine suite
 python tests/test_hbdb.py
+
+# Resolver (OCC) suite, incl. the pure-Python fallback path
+python tests/test_resolver.py
+
+# FDB-style engine verification scripts (write WAL/snapshot files to CWD)
+python tests/verify_durability.py
+python tests/verify_recovery.py
+python tests/verify_snapshot.py
+python tests/verify_truncation.py
+python tests/verify_wal_corruption.py
+python tests/verify_range.py
+python tests/verify_sql_index.py
+
+# Cluster integration (spawns local coordinator + storage subprocesses)
+python tests/verify_sharding.py
+python tests/verify_replication.py
 ```
 
 ## Running Benchmark
@@ -136,6 +168,6 @@ python examples/benchmark.py
 - `UPDATE` (with WHERE)
 - `DELETE` (with WHERE)
 
-## Why "Badger"?
-
-Badgers are everywhere, highly adaptable, and incredibly efficient - just like we want this database to be.
+(The FDB-style engine's SQL layer additionally supports `CREATE INDEX`
+with index-scan execution; see `hbdb/sql/engine.py` and
+`tests/verify_sql_index.py`.)

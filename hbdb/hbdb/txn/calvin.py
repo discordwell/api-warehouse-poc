@@ -15,8 +15,8 @@ from ..types import Transaction, LogEntry, TxnId, TxnStatus, Timestamp
 from ..sequencer import Sequencer, TransactionLog
 from ..storage import ShardManager
 from ..sql.schema import Schema
-from ..sql.executor import Executor, QueryResult
-from ..sql.parser import SQLParser
+from ..sql.legacy.executor import Executor, QueryResult
+from ..sql.legacy.parser import SQLParser
 
 
 class CalvinExecutor:
