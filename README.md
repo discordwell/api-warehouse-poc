@@ -1,5 +1,20 @@
 # API → Data Warehouse POC
 
+## Repository Layout
+
+This repo started as the data-warehouse challenge described below and has
+grown to host a few related data-infrastructure POCs:
+
+| Directory | Contents |
+|-----------|----------|
+| `challenge/` | Challenge prompt and sample API responses |
+| `solution/` | Warehouse implementation: ingest scripts, schema, dashboards |
+| `verify/` | SQL queries used to verify the warehouse |
+| `hbdb/` | Distributed SQL database POC (Calvin-style and FDB-style engines) |
+| `shardstore/` | Dynamo/Cassandra-style distributed KV store POC |
+
+Each sub-project has its own README.
+
 ## Challenge
 
 You have access to two public APIs. Your task is to build a local data warehouse that ingests, normalizes, and stores data from both sources.

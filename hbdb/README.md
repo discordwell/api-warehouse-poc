@@ -129,6 +129,8 @@ Shard Distribution:  4.2% variance (excellent)
 ## Running Tests
 
 ```bash
+pip install -r requirements.txt
+
 # (optional) build the C++ native extension; everything falls back to
 # pure Python without it
 python setup.py build_ext --inplace

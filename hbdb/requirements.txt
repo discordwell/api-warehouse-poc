@@ -1,0 +1,11 @@
+# Runtime dependencies
+sortedcontainers>=2.4.0   # pure-Python MVCC store + resolver fallback
+pybloom-live>=4.0.0       # table-prefix bloom filters
+sqlglot>=20.0.0           # plan-based SQL engine (hbdb/sql)
+
+# Build-time (optional): C++ native extension
+# python setup.py build_ext --inplace
+pybind11>=2.5.0
+
+# Optional: CockroachDB comparison benchmarks only
+# psycopg2-binary>=2.9
