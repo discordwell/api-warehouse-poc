@@ -8,8 +8,14 @@ from ..core.proxy import Transaction
 from ..core.cache import get_read_cache
 
 class ExecutionContext:
-    def __init__(self, txn: Transaction):
+    def __init__(self, txn: Transaction, cache=None):
         self.txn = txn
+        # The read cache is scoped to one database: its keys are storage keys
+        # like /t/{table_id}/_r/{pk}, and table ids restart at 1 for every
+        # HBDB, so a process-wide singleton would collide across instances and
+        # serve one database's row for another's. Callers pass the per-DB
+        # cache; the global is only a fallback for ad-hoc construction.
+        self.cache = cache if cache is not None else get_read_cache()
 
 class PhysicalOperator(ABC):
     @abstractmethod
@@ -21,7 +27,7 @@ class TableScanExecutor(PhysicalOperator):
         self.ctx = ctx
         self.node = node
         self.encoder = KeyEncoder()
-        self._cache = get_read_cache()
+        self._cache = ctx.cache
 
     def next(self) -> Iterator[Dict[str, Any]]:
         start = f"/t/{self.node.table_id}/_r/"
@@ -62,45 +68,44 @@ class InsertExecutor(PhysicalOperator):
         self.ctx = ctx
         self.node = node
         self.catalog = catalog
-        self._cache = get_read_cache()
+        self._cache = ctx.cache
 
     def next(self) -> Iterator[Dict[str, Any]]:
-        # 1. Encode Key
         pk_col = self.node.schema.get_pk_column()
         if not pk_col: raise ValueError("PK required")
 
-        pk_val = self.node.values.get(pk_col.name)
-        key = KeyEncoder.encode_row(self.node.table_id, pk_val)
+        indexes = (self.catalog.get_indexes_for_table(self.node.table_id)
+                   if self.catalog else [])
 
-        # 2. Encode Value
-        val = KeyEncoder.encode_row_value(self.node.values)
+        count = 0
+        for values in self.node.rows:
+            # 1. Encode key + value and write the row
+            pk_val = values.get(pk_col.name)
+            key = KeyEncoder.encode_row(self.node.table_id, pk_val)
+            self.ctx.txn.set(key, KeyEncoder.encode_row_value(values))
+            # Drop any cached decode of this key (e.g. a re-inserted PK that
+            # was previously read/deleted); the read cache is not write-through.
+            self._cache.invalidate(key)
 
-        # 3. Write row
-        self.ctx.txn.set(key, val)
-        # Drop any cached decode of this key (e.g. a re-inserted PK that was
-        # previously read/deleted); the read cache is not write-through.
-        self._cache.invalidate(key)
-
-        # 4. Write to secondary indexes
-        if self.catalog:
-            indexes = self.catalog.get_indexes_for_table(self.node.table_id)
+            # 2. Write to secondary indexes
             for idx in indexes:
-                indexed_val = self.node.values.get(idx.column_name)
+                indexed_val = values.get(idx.column_name)
                 if indexed_val is not None:
                     idx_key = KeyEncoder.encode_index(
                         self.node.table_id, idx.id, indexed_val, pk_val
                     )
                     # Index value is just the PK (for point lookup)
                     self.ctx.txn.set(idx_key, str(pk_val))
-        
-        yield {"count": 1}
+            count += 1
+
+        yield {"count": count}
 
 class UpdateExecutor(PhysicalOperator):
     def __init__(self, ctx: ExecutionContext, node: LogicalUpdate, catalog=None):
         self.ctx = ctx
         self.node = node
         self.catalog = catalog
-        self._cache = get_read_cache()
+        self._cache = ctx.cache
 
     def next(self) -> Iterator[Dict[str, Any]]:
         # 1. Scan all rows
@@ -126,13 +131,12 @@ class UpdateExecutor(PhysicalOperator):
                 # any secondary-index entry whose key changed.
                 old_indexed = {idx.id: row.get(idx.column_name) for idx in indexes}
 
-                # 3. Apply SET clause
+                # 3. Apply SET clause. Every value is a sqlglot node; the
+                # shared resolver handles literals of all types (int, float,
+                # negative, bool, NULL) as well as column expressions like
+                # balance + 10. (Plain Python values pass through unchanged.)
                 for col, new_val in self.node.set_clause.items():
-                    if isinstance(new_val, (int, str)):
-                        row[col] = new_val
-                    else:
-                        # Expression evaluation (e.g., balance + 10)
-                        row[col] = resolve_operand(new_val, row)
+                    row[col] = resolve_operand(new_val, row)
 
                 # 4. Write back
                 new_val_enc = KeyEncoder.encode_row_value(row)
@@ -167,7 +171,7 @@ class DeleteExecutor(PhysicalOperator):
         self.ctx = ctx
         self.node = node
         self.catalog = catalog
-        self._cache = get_read_cache()
+        self._cache = ctx.cache
 
     def next(self) -> Iterator[Dict[str, Any]]:
         start = f"/t/{self.node.table_id}/_r/"

@@ -200,7 +200,7 @@ class SQLParser:
         table_name = table_exp.name
         table = self.catalog.get_table(table_name)
         if not table: raise ValueError(f"Table {table_name} not found")
-        
+
         # Parse column names from the Schema node
         schema_node = node.this
         if schema_node and schema_node.expressions:
@@ -208,36 +208,43 @@ class SQLParser:
         else:
             # If no columns specified, use schema order
             cols = [c.name for c in table.schema.columns]
-            
-        # Parse VALUES
+
+        # Parse VALUES. A single statement can carry several tuples
+        # (INSERT ... VALUES (..), (..), ..); bind every one of them, not
+        # just the first -- silently dropping the rest was data loss.
         values_clause = node.expression
-        if not values_clause:
+        if not values_clause or not values_clause.expressions:
             raise ValueError("INSERT without VALUES not supported")
-            
-        first_tuple = values_clause.expressions[0]
-        vals = []
-        for v in first_tuple.expressions:
-            # Handle different literal types
-            if isinstance(v, exp.Literal):
-                if v.is_string:
-                    vals.append(v.this)
-                else:
-                    vals.append(int(v.this) if v.this.isdigit() else v.this)
-            elif hasattr(v, 'name'):
-                vals.append(v.name)
-            else:
-                vals.append(str(v.this))
-        
-        # Build dict
-        row_map = dict(zip(cols, vals))
-            
+
+        rows = []
+        for tup in values_clause.expressions:
+            vals = [self._literal_value(v) for v in tup.expressions]
+            if len(vals) != len(cols):
+                raise ValueError(
+                    f"INSERT has {len(vals)} values for {len(cols)} columns")
+            rows.append(dict(zip(cols, vals)))
+
         return LogicalInsert(
-            children=[], 
-            schema=table.schema, 
-            table_name=table.name, 
+            children=[],
+            schema=table.schema,
+            table_name=table.name,
             table_id=table.id,
-            values=row_map
+            rows=rows
         )
+
+    @staticmethod
+    def _literal_value(node):
+        """Convert a VALUES literal node to a Python value.
+
+        Delegates to the predicate operand resolver, the single source of
+        truth for operand -> value coercion, so floats, negative numbers,
+        booleans and NULL convert correctly. The old ad-hoc
+        ``int(x) if x.isdigit() else x`` mangled everything but ints and
+        strings: floats became strings, ``-5`` lost its sign, ``TRUE``
+        became ``''`` and ``NULL`` became the string ``'NULL'``.
+        """
+        from .predicates import resolve
+        return resolve(node, {})
 
     def _bind_update(self, node: exp.Update) -> LogicalNode:
         table_exp = node.find(exp.Table)
@@ -247,17 +254,16 @@ class SQLParser:
         table = self.catalog.get_table(table_name)
         if not table: raise ValueError(f"Table {table_name} not found")
         
-        # Parse SET clause
+        # Parse SET clause. Keep the raw sqlglot node for every assignment
+        # and let the executor resolve it per row: that path already handles
+        # column expressions (e.g. balance + 10) and, via the shared operand
+        # resolver, literals of every type. Pre-converting literals here used
+        # the same broken int/str-only logic as INSERT, so `SET price = 2.5`
+        # stored the string '2.5'.
         set_clause = {}
         for eq in node.expressions:
             if isinstance(eq, exp.EQ):
-                col = eq.left.name
-                val_node = eq.right
-                if isinstance(val_node, exp.Literal):
-                    val = int(val_node.this) if val_node.this.isdigit() else val_node.this
-                else:
-                    val = val_node  # Expression (e.g., col + 1)
-                set_clause[col] = val
+                set_clause[eq.left.name] = eq.right
         
         condition = node.args.get("where")
         

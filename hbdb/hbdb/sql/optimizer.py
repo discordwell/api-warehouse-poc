@@ -119,6 +119,7 @@ class Optimizer:
                 indexes = self.catalog.get_indexes_for_table(child.table_id)
                 # Check if filter column has index
                 from sqlglot import exp
+                from .predicates import resolve
                 cond = node.condition
                 if isinstance(cond, exp.Where):
                     cond = cond.this
@@ -126,11 +127,21 @@ class Optimizer:
                     col = cond.left.name
                     for idx in indexes:
                         if idx.column_name == col:
-                            # Mark for index scan (metadata flag)
-                            child.index_id = idx.id
-                            # Evaluate literal value
-                            val = cond.right.this if hasattr(cond.right, 'this') else str(cond.right)
-                            child.lookup_value = val
+                            # Resolve the lookup value through the shared
+                            # operand resolver so it carries the same Python
+                            # type INSERT stored in the index (e.g. -5, not the
+                            # string "5" that cond.right.this yields for a
+                            # negative literal -- which made indexed `= -5`
+                            # silently miss while a full scan found the row).
+                            # Only use the index for a concrete scalar; anything
+                            # else falls back to a scan + filter, always correct.
+                            try:
+                                lookup = resolve(cond.right, {})
+                            except NotImplementedError:
+                                lookup = None
+                            if lookup is not None:
+                                child.index_id = idx.id
+                                child.lookup_value = lookup
                             return node
         return node
 

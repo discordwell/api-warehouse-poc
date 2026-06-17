@@ -28,7 +28,7 @@ class LogicalProject(LogicalNode):
 class LogicalInsert(LogicalNode):
     table_name: str
     table_id: int
-    values: Dict[str, Any] # Column -> Value
+    rows: List[Dict[str, Any]]  # one Column -> Value dict per VALUES tuple
 
 @dataclass
 class LogicalUpdate(LogicalNode):

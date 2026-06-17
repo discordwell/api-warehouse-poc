@@ -1,6 +1,7 @@
 from .core.backend import VersionedKVStore
 from .core.resolver import Resolver, PartitionedResolver
 from .core.proxy import Transaction
+from .core.cache import LRUCache
 from typing import Any
 
 class HBDB:
@@ -19,6 +20,10 @@ class HBDB:
                              only; ignored when connect_to is set.
         """
         self.remote_addr = connect_to
+        # Per-database read cache for the SQL layer. Scoping it to the
+        # instance (rather than a process-wide singleton) keeps two HBDBs in
+        # the same process from colliding on identical storage keys.
+        self.read_cache = LRUCache()
         if self.remote_addr:
             from hbdb.client.client import ClusterClient, HBDBClient
             

@@ -163,6 +163,8 @@ python tests/verify_truncation.py
 python tests/verify_wal_corruption.py
 python tests/verify_range.py
 python tests/verify_sql_index.py
+python tests/verify_sql_predicates.py
+python tests/verify_sql_insert.py
 
 # Cluster integration (spawns local coordinator + storage subprocesses)
 python tests/verify_sharding.py
@@ -179,7 +181,7 @@ python examples/benchmark.py
 
 - `CREATE TABLE` (with PRIMARY KEY)
 - `DROP TABLE`
-- `INSERT INTO`
+- `INSERT INTO` (single- and multi-row `VALUES (..), (..), ..`)
 - `SELECT` (with WHERE, column filtering)
 - `UPDATE` (with WHERE)
 - `DELETE` (with WHERE)
@@ -194,3 +196,9 @@ SQL three-valued (NULL) logic; predicate evaluation lives in
 `hbdb/sql/predicates.py` and is shared by the filter/update/delete operators
 (`tests/verify_sql_predicates.py`). `SELECT col, ...` projects to the listed
 columns; `SELECT *` returns all.
+
+`INSERT`/`UPDATE` value literals are coerced through that same operand
+resolver, so floats, negative numbers, booleans and `NULL` keep their real
+types instead of being mangled into strings (`tests/verify_sql_insert.py`).
+The SQL read cache is scoped to each `HBDB` instance, so two databases in one
+process never serve one another's rows.

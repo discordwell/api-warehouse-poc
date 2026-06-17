@@ -41,7 +41,7 @@ class SQLEngine:
         optimized_plan = self.optimizer.optimize(logical_plan)
 
         # 4. Execute
-        ctx = ExecutionContext(txn)
+        ctx = ExecutionContext(txn, getattr(self.db, "read_cache", None))
         plan = build_physical_plan(ctx, optimized_plan, self.catalog)
 
         results = list(plan.next())
