@@ -50,9 +50,3 @@ class TableBloomFilter:
         """Drop all filters (used when rebuilding from a snapshot)."""
         with self._lock:
             self._filters.clear()
-
-# Global bloom filter instance
-_bloom_filter = TableBloomFilter()
-
-def get_bloom_filter() -> TableBloomFilter:
-    return _bloom_filter
