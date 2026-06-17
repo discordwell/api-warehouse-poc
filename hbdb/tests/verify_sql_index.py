@@ -80,5 +80,67 @@ def verify_index():
         print(f"❌ FAILURE: Expected ids [2, 3, 4], got {ids}")
         exit(1)
 
+
+def verify_write_consistency():
+    """UPDATE/DELETE must be visible to later reads and keep indexes in sync.
+
+    Regression for two bugs:
+      - The SQL read cache was never invalidated on write, so a SELECT after
+        an UPDATE returned the stale (pre-update) row.
+      - UPDATE/DELETE never maintained secondary indexes, so the index kept
+        pointing at the old value (or a deleted row).
+    """
+    print("\nVerifying write consistency (read cache + index upkeep)...")
+    db = HBDB()
+    engine = SQLEngine(db)
+
+    engine.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, owner TEXT, balance INTEGER)")
+    engine.execute("CREATE INDEX idx_balance ON accounts (balance)")
+    engine.execute("INSERT INTO accounts VALUES (1, 'Alice', 100)")
+    engine.execute("INSERT INTO accounts VALUES (2, 'Bob', 300)")
+
+    table = engine.catalog.get_table("accounts")
+    idx = engine.catalog.get_indexes_for_table(table.id)[0]
+    idx_lo, idx_hi = f"/t/{table.id}/_i/", f"/t/{table.id}/_i/~"
+
+    def live_index_keys():
+        # txn.scan hides None tombstones, so this is the set of live entries.
+        return sorted(k for k, _ in db.transaction().scan(idx_lo, idx_hi))
+
+    # Warm the read cache, then mutate and read again.
+    engine.execute("SELECT id, owner, balance FROM accounts")
+    engine.execute("UPDATE accounts SET balance = 200 WHERE id = 1")
+
+    after = {r["id"]: r["balance"] for r in engine.execute("SELECT id, owner, balance FROM accounts")}
+    if after.get(1) == 200:
+        print("✅ SUCCESS: read after UPDATE reflects the new value.")
+    else:
+        print(f"❌ FAILURE: stale read after UPDATE: {after}")
+        exit(1)
+
+    keys = live_index_keys()
+    if f"/t/{table.id}/_i/{idx.id}/200/1" in keys and not any("/100/" in k for k in keys):
+        print("✅ SUCCESS: UPDATE rewrote the secondary index entry.")
+    else:
+        print(f"❌ FAILURE: index not updated: {keys}")
+        exit(1)
+
+    engine.execute("DELETE FROM accounts WHERE id = 2")
+    keys = live_index_keys()
+    if not any(k.endswith("/300/2") for k in keys):
+        print("✅ SUCCESS: DELETE tombstoned the secondary index entry.")
+    else:
+        print(f"❌ FAILURE: stale index entry after DELETE: {keys}")
+        exit(1)
+
+    remaining = sorted(r["id"] for r in engine.execute("SELECT id, owner, balance FROM accounts"))
+    if remaining == [1]:
+        print("✅ SUCCESS: table reflects the DELETE.")
+    else:
+        print(f"❌ FAILURE: expected ids [1], got {remaining}")
+        exit(1)
+
+
 if __name__ == "__main__":
     verify_index()
+    verify_write_consistency()

@@ -101,21 +101,25 @@ class InsertExecutor(PhysicalOperator):
         self.ctx = ctx
         self.node = node
         self.catalog = catalog
+        self._cache = get_read_cache()
 
     def next(self) -> Iterator[Dict[str, Any]]:
         # 1. Encode Key
         pk_col = self.node.schema.get_pk_column()
         if not pk_col: raise ValueError("PK required")
-        
+
         pk_val = self.node.values.get(pk_col.name)
         key = KeyEncoder.encode_row(self.node.table_id, pk_val)
-        
+
         # 2. Encode Value
         val = KeyEncoder.encode_row_value(self.node.values)
-        
+
         # 3. Write row
         self.ctx.txn.set(key, val)
-        
+        # Drop any cached decode of this key (e.g. a re-inserted PK that was
+        # previously read/deleted); the read cache is not write-through.
+        self._cache.invalidate(key)
+
         # 4. Write to secondary indexes
         if self.catalog:
             indexes = self.catalog.get_indexes_for_table(self.node.table_id)
@@ -131,27 +135,36 @@ class InsertExecutor(PhysicalOperator):
         yield {"count": 1}
 
 class UpdateExecutor(PhysicalOperator):
-    def __init__(self, ctx: ExecutionContext, node: LogicalUpdate):
+    def __init__(self, ctx: ExecutionContext, node: LogicalUpdate, catalog=None):
         self.ctx = ctx
         self.node = node
+        self.catalog = catalog
+        self._cache = get_read_cache()
 
     def next(self) -> Iterator[Dict[str, Any]]:
         # 1. Scan all rows
         start = f"/t/{self.node.table_id}/_r/"
         end = f"/t/{self.node.table_id}/_r/~"
         kv_pairs = self.ctx.txn.scan(start, end)
-        
+
         pk_col = self.node.schema.get_pk_column()
         pk_name = pk_col.name if pk_col else "id"
-        
+
+        indexes = (self.catalog.get_indexes_for_table(self.node.table_id)
+                   if self.catalog else [])
+
         count = 0
         for key, val in kv_pairs:
             row = KeyEncoder.decode_row_value(val)
             pk_val = KeyEncoder.decode_row_pk(key)
             row[pk_name] = int(pk_val) if pk_val.isdigit() else pk_val
-            
+
             # 2. Filter by condition
             if self._matches(self.node.condition, row):
+                # Capture indexed values before mutating so we can rewrite
+                # any secondary-index entry whose key changed.
+                old_indexed = {idx.id: row.get(idx.column_name) for idx in indexes}
+
                 # 3. Apply SET clause
                 for col, new_val in self.node.set_clause.items():
                     if isinstance(new_val, (int, str)):
@@ -159,13 +172,34 @@ class UpdateExecutor(PhysicalOperator):
                     else:
                         # Expression evaluation (e.g., balance + 10)
                         row[col] = self._eval_expr(new_val, row)
-                
+
                 # 4. Write back
                 new_val_enc = KeyEncoder.encode_row_value(row)
                 self.ctx.txn.set(key, new_val_enc)
+                # The read cache is not write-through; drop the stale decode.
+                self._cache.invalidate(key)
+
+                # 5. Maintain secondary indexes: tombstone the old entry and
+                # add the new one for any indexed column that changed.
+                self._maintain_indexes(indexes, pk_val, old_indexed, row)
                 count += 1
-        
+
         yield {"count": count}
+
+    def _maintain_indexes(self, indexes, pk_val, old_indexed, row):
+        for idx in indexes:
+            old_v = old_indexed[idx.id]
+            new_v = row.get(idx.column_name)
+            if old_v == new_v:
+                continue
+            if old_v is not None:
+                old_key = KeyEncoder.encode_index(
+                    self.node.table_id, idx.id, old_v, pk_val)
+                self.ctx.txn.set(old_key, None)  # tombstone
+            if new_v is not None:
+                new_key = KeyEncoder.encode_index(
+                    self.node.table_id, idx.id, new_v, pk_val)
+                self.ctx.txn.set(new_key, str(pk_val))
 
     def _matches(self, condition, row):
         if condition is None: return True
@@ -195,30 +229,45 @@ class UpdateExecutor(PhysicalOperator):
         return expr
 
 class DeleteExecutor(PhysicalOperator):
-    def __init__(self, ctx: ExecutionContext, node: LogicalDelete):
+    def __init__(self, ctx: ExecutionContext, node: LogicalDelete, catalog=None):
         self.ctx = ctx
         self.node = node
+        self.catalog = catalog
+        self._cache = get_read_cache()
 
     def next(self) -> Iterator[Dict[str, Any]]:
         start = f"/t/{self.node.table_id}/_r/"
         end = f"/t/{self.node.table_id}/_r/~"
         kv_pairs = self.ctx.txn.scan(start, end)
-        
+
         pk_col = self.node.schema.get_pk_column()
         pk_name = pk_col.name if pk_col else "id"
-        
+
+        indexes = (self.catalog.get_indexes_for_table(self.node.table_id)
+                   if self.catalog else [])
+
         count = 0
         for key, val in kv_pairs:
             row = KeyEncoder.decode_row_value(val)
             pk_val = KeyEncoder.decode_row_pk(key)
             row[pk_name] = int(pk_val) if pk_val.isdigit() else pk_val
-            
+
             if self._matches(self.node.condition, row):
-                # Delete by setting to None (or use a tombstone)
-                # For POC, we'll set to empty - real system uses tombstones
+                # Delete by writing a None tombstone; scans filter these out.
                 self.ctx.txn.set(key, None)
+                # The read cache is not write-through; drop the stale decode.
+                self._cache.invalidate(key)
+
+                # Tombstone this row's secondary-index entries too, so an
+                # index scan can't resurrect a pointer to the deleted row.
+                for idx in indexes:
+                    idx_v = row.get(idx.column_name)
+                    if idx_v is not None:
+                        idx_key = KeyEncoder.encode_index(
+                            self.node.table_id, idx.id, idx_v, pk_val)
+                        self.ctx.txn.set(idx_key, None)
                 count += 1
-        
+
         yield {"count": count}
 
     def _matches(self, condition, row):
@@ -360,9 +409,9 @@ def build_physical_plan(ctx: ExecutionContext, logical: LogicalNode, catalog=Non
     elif isinstance(logical, LogicalInsert):
         return InsertExecutor(ctx, logical, catalog)
     elif isinstance(logical, LogicalUpdate):
-        return UpdateExecutor(ctx, logical)
+        return UpdateExecutor(ctx, logical, catalog)
     elif isinstance(logical, LogicalDelete):
-        return DeleteExecutor(ctx, logical)
+        return DeleteExecutor(ctx, logical, catalog)
     elif isinstance(logical, LogicalJoin):
         left_op = build_physical_plan(ctx, logical.left, catalog)
         right_op = build_physical_plan(ctx, logical.right, catalog)
