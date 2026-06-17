@@ -2,9 +2,10 @@ import sqlglot
 from sqlglot import exp
 from typing import Any, Dict, List
 from .catalog import Catalog
-from .plan import (LogicalNode, LogicalScan, LogicalFilter, LogicalProject, 
+from .plan import (LogicalNode, LogicalScan, LogicalFilter, LogicalProject,
                    LogicalInsert, LogicalUpdate, LogicalDelete, LogicalJoin,
-                   LogicalCreateTable, LogicalCreateIndex)
+                   LogicalCreateTable, LogicalCreateIndex, LogicalSort,
+                   LogicalLimit)
 from .types import Schema, Column
 
 class SQLParser:
@@ -105,41 +106,129 @@ class SQLParser:
     def _bind_select(self, node: exp.Select) -> LogicalNode:
         # Check for JOINs
         joins = node.args.get("joins")
-        
+
         if joins:
             # Handle JOIN
             return self._bind_select_with_join(node, joins)
-        
+
+        # Reject clauses we cannot honor *before* building a plan, so an
+        # unsupported query fails loudly rather than silently returning the
+        # wrong rows (the same fail-loud contract predicates.py enforces).
+        self._reject_unsupported(node)
+
         # Simple SELECT (no JOIN)
         table_exp = node.find(exp.Table)
         if not table_exp:
             raise ValueError("SELECT without FROM not supported")
-            
+
         table_name = table_exp.name
         table = self.catalog.get_table(table_name)
         if not table:
             raise ValueError(f"Table {table_name} not found")
-            
+
         root = LogicalScan(children=[], schema=table.schema, table_name=table.name, table_id=table.id)
-        
+
         # Bind WHERE (Filter)
         if node.args.get("where"):
             root = LogicalFilter(children=[root], schema=root.schema, condition=node.args.get("where"))
 
-        # Bind SELECT (Project). Only project plain column lists; SELECT *,
-        # aggregates, functions and aliased expressions stream through with
-        # all columns (projecting them by `.name` would mangle the result).
+        # Decide projection. Only project plain column lists; SELECT *,
+        # functions and aliased expressions stream through with all columns
+        # (projecting them by `.name` would mangle the result). `select_cols`
+        # is the projected name list, or None for "all columns".
         projections = node.expressions
         is_star = len(projections) == 1 and isinstance(projections[0], exp.Star)
-        if not is_star and projections and all(
-            isinstance(p, (exp.Column, exp.Identifier)) for p in projections
-        ):
-            col_names = [p.name for p in projections]
-            root = LogicalProject(children=[root], schema=root.schema, column_names=col_names)
+        bare_cols = (not is_star and bool(projections) and all(
+            isinstance(p, (exp.Column, exp.Identifier)) for p in projections))
+        select_cols = [p.name for p in projections] if bare_cols else None
+
+        # Bind ORDER BY *below* the projection so it can sort on columns that
+        # are not in the SELECT list (SELECT name FROM t ORDER BY age).
+        order = node.args.get("order")
+        if order:
+            keys = self._build_sort_keys(order, select_cols, table.schema)
+            root = LogicalSort(children=[root], schema=root.schema, keys=keys)
+
+        # Bind SELECT (Project).
+        if select_cols is not None:
+            root = LogicalProject(children=[root], schema=root.schema, column_names=select_cols)
+
+        # Bind LIMIT / OFFSET at the very top (applied after sort + project).
+        root = self._maybe_limit(node, root)
 
         return root
 
+    @staticmethod
+    def _reject_unsupported(node: exp.Select):
+        """Fail loudly on SELECT features the engine does not implement.
+
+        Without this, GROUP BY / HAVING / DISTINCT / aggregates were silently
+        dropped and the query returned raw rows -- e.g. ``SELECT COUNT(*)``
+        returned every row instead of a count. Raising keeps the engine
+        honest until these are actually supported.
+        """
+        if node.args.get("distinct"):
+            raise NotImplementedError("SELECT DISTINCT is not supported")
+        if node.args.get("group"):
+            raise NotImplementedError("GROUP BY is not supported")
+        if node.args.get("having"):
+            raise NotImplementedError("HAVING is not supported")
+        for proj in node.expressions:
+            if proj.find(exp.AggFunc):
+                raise NotImplementedError(
+                    f"Aggregate functions are not supported: {proj.sql()}")
+
+    def _build_sort_keys(self, order: exp.Order, select_cols, schema):
+        """Turn an sqlglot ORDER BY clause into (expr, desc, nulls_first) keys."""
+        keys = []
+        for ordered in order.expressions:  # exp.Ordered
+            expr = ordered.this
+            desc = bool(ordered.args.get("desc"))
+            nulls_first = ordered.args.get("nulls_first")
+            if nulls_first is None:
+                # sqlglot fills this in per direction, but be defensive:
+                # default to SQL's "NULL is the smallest value" (NULLs first
+                # ascending, last descending).
+                nulls_first = not desc
+            # Positional ORDER BY (ORDER BY 1) -> the matching output column.
+            if isinstance(expr, exp.Literal) and not expr.is_string:
+                expr = self._positional_to_column(expr, select_cols, schema)
+            keys.append((expr, desc, bool(nulls_first)))
+        return keys
+
+    @staticmethod
+    def _positional_to_column(lit: exp.Literal, select_cols, schema):
+        try:
+            pos = int(lit.this)
+        except (TypeError, ValueError):
+            return lit  # not an integer position; leave as a constant operand
+        cols = select_cols if select_cols is not None else [c.name for c in schema.columns]
+        if 1 <= pos <= len(cols):
+            return exp.column(cols[pos - 1])
+        raise ValueError(f"ORDER BY position {pos} is out of range")
+
+    def _maybe_limit(self, node: exp.Select, root: LogicalNode) -> LogicalNode:
+        limit_node = node.args.get("limit")
+        offset_node = node.args.get("offset")
+        if not limit_node and not offset_node:
+            return root
+        limit = self._int_arg(limit_node.expression) if limit_node else None
+        offset = self._int_arg(offset_node.expression) if offset_node else 0
+        return LogicalLimit(children=[root], schema=root.schema, limit=limit, offset=offset)
+
+    @staticmethod
+    def _int_arg(expr) -> int:
+        """Coerce a LIMIT/OFFSET operand (an integer literal) to a non-negative int."""
+        from .predicates import resolve
+        try:
+            val = int(resolve(expr, {}))
+        except (TypeError, ValueError, NotImplementedError):
+            raise ValueError(f"LIMIT/OFFSET requires an integer, got {expr.sql()}")
+        return max(0, val)
+
     def _bind_select_with_join(self, node: exp.Select, joins) -> LogicalNode:
+        self._reject_unsupported(node)
+
         # Get all tables - first one is the left (FROM) table
         all_tables = list(node.find_all(exp.Table))
         if not all_tables:
@@ -189,7 +278,15 @@ class SQLParser:
         # Apply WHERE if present
         if node.args.get("where"):
             root = LogicalFilter(children=[root], schema=root.schema, condition=node.args.get("where"))
-        
+
+        # ORDER BY / LIMIT / OFFSET. The join path projects nothing, so sort
+        # keys resolve against the merged schema and positional refs index it.
+        order = node.args.get("order")
+        if order:
+            keys = self._build_sort_keys(order, None, root.schema)
+            root = LogicalSort(children=[root], schema=root.schema, keys=keys)
+        root = self._maybe_limit(node, root)
+
         return root
 
     def _bind_insert(self, node: exp.Insert) -> LogicalNode:

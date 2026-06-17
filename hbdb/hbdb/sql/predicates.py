@@ -183,6 +183,16 @@ def _coerce_pair(a, b):
     return a, b
 
 
+def coerce_pair(a, b):
+    """Public alias of the numeric-coercion helper.
+
+    Shared with the ORDER BY comparator (``sql/executor.py``) so sorting uses
+    the same number/string coercion as WHERE comparisons -- e.g. the string
+    ``"9"`` sorts before ``"10"`` numerically rather than lexicographically.
+    """
+    return _coerce_pair(a, b)
+
+
 def _as_number(value):
     if isinstance(value, bool):
         return None

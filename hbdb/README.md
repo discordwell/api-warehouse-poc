@@ -165,6 +165,7 @@ python tests/verify_range.py
 python tests/verify_sql_index.py
 python tests/verify_sql_predicates.py
 python tests/verify_sql_insert.py
+python tests/verify_sql_orderlimit.py
 
 # Cluster integration (spawns local coordinator + storage subprocesses)
 python tests/verify_sharding.py
@@ -182,7 +183,7 @@ python examples/benchmark.py
 - `CREATE TABLE` (with PRIMARY KEY)
 - `DROP TABLE`
 - `INSERT INTO` (single- and multi-row `VALUES (..), (..), ..`)
-- `SELECT` (with WHERE, column filtering)
+- `SELECT` (with WHERE, column projection, `ORDER BY`, `LIMIT`/`OFFSET`)
 - `UPDATE` (with WHERE)
 - `DELETE` (with WHERE)
 
@@ -202,3 +203,14 @@ resolver, so floats, negative numbers, booleans and `NULL` keep their real
 types instead of being mangled into strings (`tests/verify_sql_insert.py`).
 The SQL read cache is scoped to each `HBDB` instance, so two databases in one
 process never serve one another's rows.
+
+`ORDER BY` (multi-key, `ASC`/`DESC`, `NULLS FIRST`/`LAST`, expressions like
+`age * -1`, and positional `ORDER BY 1`) plus `LIMIT`/`OFFSET` are honored by
+the FDB-style engine; sort keys resolve through the shared operand resolver,
+so they use the same numeric/string coercion as `WHERE`
+(`tests/verify_sql_orderlimit.py`). NULL ordering follows SQL's "NULL is the
+smallest value" default unless an explicit `NULLS FIRST`/`LAST` is given.
+Clauses the engine does not implement yet — `GROUP BY`, `HAVING`,
+`DISTINCT` and aggregate functions (`COUNT`, `SUM`, ...) — raise
+`NotImplementedError` rather than silently dropping the clause and returning
+the wrong rows (the same fail-loud contract the `WHERE` evaluator uses).

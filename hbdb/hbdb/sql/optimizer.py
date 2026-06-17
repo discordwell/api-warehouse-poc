@@ -93,13 +93,14 @@ class Optimizer:
     def optimize(self, plan: LogicalNode) -> LogicalNode:
         # Phase 1: Predicate Pushdown
         plan = self._push_predicates(plan)
-        
-        # Phase 2: Index Selection (for Filter -> Scan patterns)
-        plan = self._select_indexes(plan)
-        
+
+        # Phase 2: Index Selection (for Filter -> Scan patterns). Mutates the
+        # LogicalScan nodes in place, so no reassignment.
+        self._select_indexes(plan)
+
         # Phase 3: Join Reordering (if multiple joins)
         plan = self._reorder_joins(plan)
-        
+
         return plan
 
     def _push_predicates(self, node: LogicalNode) -> LogicalNode:
@@ -111,39 +112,54 @@ class Optimizer:
                 pass
         return node
 
-    def _select_indexes(self, node: LogicalNode) -> LogicalNode:
-        # Check if Filter on indexed column
-        if isinstance(node, LogicalFilter):
-            child = node.children[0] if node.children else None
-            if isinstance(child, LogicalScan):
-                indexes = self.catalog.get_indexes_for_table(child.table_id)
-                # Check if filter column has index
-                from sqlglot import exp
-                from .predicates import resolve
-                cond = node.condition
-                if isinstance(cond, exp.Where):
-                    cond = cond.this
-                if isinstance(cond, exp.EQ) and hasattr(cond.left, 'name'):
-                    col = cond.left.name
-                    for idx in indexes:
-                        if idx.column_name == col:
-                            # Resolve the lookup value through the shared
-                            # operand resolver so it carries the same Python
-                            # type INSERT stored in the index (e.g. -5, not the
-                            # string "5" that cond.right.this yields for a
-                            # negative literal -- which made indexed `= -5`
-                            # silently miss while a full scan found the row).
-                            # Only use the index for a concrete scalar; anything
-                            # else falls back to a scan + filter, always correct.
-                            try:
-                                lookup = resolve(cond.right, {})
-                            except NotImplementedError:
-                                lookup = None
-                            if lookup is not None:
-                                child.index_id = idx.id
-                                child.lookup_value = lookup
-                            return node
-        return node
+    def _select_indexes(self, node: LogicalNode) -> None:
+        """Enable an index scan at every Filter -> Scan junction in the tree.
+
+        The plan now carries Project / Sort / Limit wrappers above the Filter
+        (column projection, ORDER BY, LIMIT), so index selection must descend
+        the tree instead of only inspecting the root -- otherwise
+        ``SELECT name FROM t WHERE col = x`` (which has a Project on top) would
+        never use an available index.
+        """
+        if node is None:
+            return
+        if (isinstance(node, LogicalFilter) and node.children
+                and isinstance(node.children[0], LogicalScan)):
+            self._maybe_index_scan(node, node.children[0])
+            return
+        if isinstance(node, LogicalJoin):
+            self._select_indexes(node.left)
+            self._select_indexes(node.right)
+            return
+        for child in getattr(node, "children", None) or []:
+            self._select_indexes(child)
+
+    def _maybe_index_scan(self, filter_node: LogicalFilter, scan: LogicalScan) -> None:
+        indexes = self.catalog.get_indexes_for_table(scan.table_id)
+        from sqlglot import exp
+        from .predicates import resolve
+        cond = filter_node.condition
+        if isinstance(cond, exp.Where):
+            cond = cond.this
+        if isinstance(cond, exp.EQ) and hasattr(cond.left, 'name'):
+            col = cond.left.name
+            for idx in indexes:
+                if idx.column_name == col:
+                    # Resolve the lookup value through the shared operand
+                    # resolver so it carries the same Python type INSERT stored
+                    # in the index (e.g. -5, not the string "5" that
+                    # cond.right.this yields for a negative literal -- which
+                    # made indexed `= -5` silently miss while a full scan found
+                    # the row). Only use the index for a concrete scalar;
+                    # anything else falls back to a scan + filter, always correct.
+                    try:
+                        lookup = resolve(cond.right, {})
+                    except NotImplementedError:
+                        lookup = None
+                    if lookup is not None:
+                        scan.index_id = idx.id
+                        scan.lookup_value = lookup
+                    return
 
     def _reorder_joins(self, node: LogicalNode) -> LogicalNode:
         # For now, keep original order

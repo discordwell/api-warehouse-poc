@@ -1,9 +1,12 @@
+import functools
 from typing import Iterator, Any, Dict, List, Tuple
 from abc import ABC, abstractmethod
 from .plan import (LogicalNode, LogicalScan, LogicalFilter, LogicalProject,
-                   LogicalInsert, LogicalUpdate, LogicalDelete, LogicalJoin)
+                   LogicalInsert, LogicalUpdate, LogicalDelete, LogicalJoin,
+                   LogicalSort, LogicalLimit)
 from .encoding import KeyEncoder
-from .predicates import evaluate as eval_predicate, resolve as resolve_operand
+from .predicates import (evaluate as eval_predicate, resolve as resolve_operand,
+                         coerce_pair)
 from ..core.proxy import Transaction
 from ..core.cache import get_read_cache
 
@@ -313,6 +316,80 @@ class ProjectExecutor(PhysicalOperator):
             yield {col: row.get(col) for col in self.columns}
 
 
+class SortExecutor(PhysicalOperator):
+    """ORDER BY: materialize the child rows and sort by the key list.
+
+    Each key is ``(expr, desc, nulls_first)``. ``expr`` is resolved per row
+    through the shared operand resolver, so ``ORDER BY age``,
+    ``ORDER BY price * qty`` and (after the parser rewrites it) positional
+    ``ORDER BY 1`` all work. ``desc`` flips the value comparison.
+    ``nulls_first`` is the absolute NULL position (sqlglot already folds the
+    SQL "NULL is the smallest value" default and any explicit NULLS
+    FIRST/LAST into it), so it is *not* re-inverted by ``desc``. Genuinely
+    incomparable values (e.g. number vs non-numeric text) fall back to a
+    stable string compare instead of raising.
+
+    This sits below any projection so ORDER BY can reference columns that are
+    not in the SELECT list (``SELECT name FROM t ORDER BY age``).
+    """
+    def __init__(self, child: PhysicalOperator, node: LogicalSort):
+        self.child = child
+        self.keys = node.keys
+
+    def next(self) -> Iterator[Dict[str, Any]]:
+        rows = list(self.child.next())
+        rows.sort(key=functools.cmp_to_key(self._cmp))
+        return iter(rows)
+
+    def _cmp(self, a: Dict[str, Any], b: Dict[str, Any]) -> int:
+        for expr, desc, nulls_first in self.keys:
+            av = resolve_operand(expr, a)
+            bv = resolve_operand(expr, b)
+            if av is None or bv is None:
+                if av is None and bv is None:
+                    continue
+                if av is None:
+                    return -1 if nulls_first else 1
+                return 1 if nulls_first else -1
+            c = self._cmp_values(av, bv)
+            if c:
+                return -c if desc else c
+        return 0
+
+    @staticmethod
+    def _cmp_values(a: Any, b: Any) -> int:
+        a, b = coerce_pair(a, b)
+        try:
+            return -1 if a < b else (1 if a > b else 0)
+        except TypeError:
+            a, b = str(a), str(b)
+            return -1 if a < b else (1 if a > b else 0)
+
+
+class LimitExecutor(PhysicalOperator):
+    """LIMIT / OFFSET: skip ``offset`` rows, then yield at most ``limit``.
+
+    Lazy: stops pulling from the child once ``limit`` rows are emitted.
+    ``limit`` of None caps nothing (a bare OFFSET).
+    """
+    def __init__(self, child: PhysicalOperator, node: LogicalLimit):
+        self.child = child
+        self.limit = node.limit
+        self.offset = node.offset or 0
+
+    def next(self) -> Iterator[Dict[str, Any]]:
+        skipped = 0
+        emitted = 0
+        for row in self.child.next():
+            if skipped < self.offset:
+                skipped += 1
+                continue
+            if self.limit is not None and emitted >= self.limit:
+                return
+            yield row
+            emitted += 1
+
+
 def build_physical_plan(ctx: ExecutionContext, logical: LogicalNode, catalog=None) -> PhysicalOperator:
     if isinstance(logical, LogicalScan):
         # Check if index scan is possible
@@ -325,6 +402,10 @@ def build_physical_plan(ctx: ExecutionContext, logical: LogicalNode, catalog=Non
         return TableScanExecutor(ctx, logical)
     elif isinstance(logical, LogicalProject):
         return ProjectExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
+    elif isinstance(logical, LogicalSort):
+        return SortExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
+    elif isinstance(logical, LogicalLimit):
+        return LimitExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
     elif isinstance(logical, LogicalFilter):
         return FilterExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
     elif isinstance(logical, LogicalInsert):

@@ -25,6 +25,20 @@ class LogicalProject(LogicalNode):
     column_names: List[str]
 
 @dataclass
+class LogicalSort(LogicalNode):
+    # ORDER BY: each key is (expr, desc, nulls_first). `expr` is a sqlglot
+    # operand node resolved per row by the shared operand resolver; `desc`
+    # flips the comparison; `nulls_first` places NULLs (absolute position,
+    # already accounting for direction).
+    keys: List[Any]
+
+@dataclass
+class LogicalLimit(LogicalNode):
+    # LIMIT / OFFSET. limit=None means "no row cap" (a bare OFFSET).
+    limit: Optional[int]
+    offset: int = 0
+
+@dataclass
 class LogicalInsert(LogicalNode):
     table_name: str
     table_id: int
