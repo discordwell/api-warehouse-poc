@@ -1,9 +1,11 @@
 """
 Verify C++ Native Snapshotting.
 """
-from hbdb.db import HBDB
 import os
-import shutil
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from hbdb.db import HBDB
 
 SNAPSHOT_FILE = "snapshot.bin"
 LOG_FILE = "transaction.log"

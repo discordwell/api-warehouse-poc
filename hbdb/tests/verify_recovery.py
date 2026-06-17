@@ -2,8 +2,11 @@
 Verify Resilience/Recovery.
 Writes data, closes DB, re-opens DB, and verifies data exists.
 """
-from hbdb.db import HBDB
 import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from hbdb.db import HBDB
 
 LOG_FILE = "transaction.log"
 

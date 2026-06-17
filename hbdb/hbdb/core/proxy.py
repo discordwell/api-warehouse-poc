@@ -73,10 +73,13 @@ class Transaction:
         # Construct result map
         result_map = {k: v for k, v in data}
         
-        # Overlay writes (Read Your Writes)
+        # Overlay writes (Read Your Writes); a buffered None is a delete
         for k in buffered_keys:
-            result_map[k] = self._write_buffer[k]
-            
+            if self._write_buffer[k] is None:
+                result_map.pop(k, None)
+            else:
+                result_map[k] = self._write_buffer[k]
+
         return sorted(result_map.items())
 
     def commit(self) -> bool:

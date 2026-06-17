@@ -9,7 +9,13 @@ import os
 import random
 import sys
 
-WORKLOAD_SCRIPT = "tests/chaos_workload.py"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Spawned workload/verify processes import hbdb, so they need the repo
+# root on their path too, regardless of the CWD this script runs from.
+CHILD_ENV = {**os.environ, "PYTHONPATH": os.pathsep.join(
+    p for p in (REPO_ROOT, os.environ.get("PYTHONPATH")) if p)}
+
+WORKLOAD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chaos_workload.py")
 TRUTH_FILE = "truth.txt"
 
 def run_chaos():
@@ -28,7 +34,7 @@ def run_chaos():
         print(f"\n[Chaos] Iteration {crashes + 1}...")
         
         # 1. Start Workload
-        p = subprocess.Popen([sys.executable, WORKLOAD_SCRIPT])
+        p = subprocess.Popen([sys.executable, WORKLOAD_SCRIPT], env=CHILD_ENV)
         
         # 2. Let it run for random time
         sleep_time = random.uniform(0.5, 2.0)
@@ -73,7 +79,7 @@ def run_chaos():
                       "from hbdb.db import HBDB; db=HBDB(); tx=db.transaction(); print(tx.get('counter'))"]
         
         try:
-            result = subprocess.check_output(verify_cmd, stderr=subprocess.STDOUT).decode().strip()
+            result = subprocess.check_output(verify_cmd, stderr=subprocess.STDOUT, env=CHILD_ENV).decode().strip()
             # Result might contain logging output "[HBDB] ..."
             # Last line should be the number
             last_line = result.splitlines()[-1]

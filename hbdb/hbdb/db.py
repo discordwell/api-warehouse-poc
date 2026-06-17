@@ -7,12 +7,16 @@ class HBDB:
     """
     HBDB: FoundationDB-style Unbundled Architecture.
     """
-    def __init__(self, num_partitions: int = 4, connect_to: str = None, rf: int = 1):
+    def __init__(self, num_partitions: int = 4, connect_to: str = None, rf: int = 1,
+                 force_python: bool = False):
         """
         :param connect_to: Connection string.
                            Simple: "host:port" (Single/Coordinator)
                            Cluster: "coord_host:port;store1:port,store2:port"
         :param rf: Replication Factor.
+        :param force_python: Skip the C++ native extension even if built
+                             (pure-Python backend + resolver). Local mode
+                             only; ignored when connect_to is set.
         """
         self.remote_addr = connect_to
         if self.remote_addr:
@@ -30,8 +34,9 @@ class HBDB:
             self.backend = None 
             self.resolver = None
         else:
-            self.backend = VersionedKVStore()
-            self.resolver = PartitionedResolver(num_partitions=num_partitions)
+            self.backend = VersionedKVStore(force_python=force_python)
+            self.resolver = PartitionedResolver(num_partitions=num_partitions,
+                                                force_python=force_python)
             self.recover()
 
     def recover(self):
@@ -41,52 +46,74 @@ class HBDB:
         import os
         import json
         import glob
-        
+
         # 1. Load Snapshot
         snapshot_path = "snapshot.bin"
-        max_ts = 0
-        
+        snapshot_ts = 0
+
         if os.path.exists(snapshot_path):
             print(f"[HBDB] Loading snapshot from {snapshot_path}...")
             # Native restoration
-            max_ts = self.backend.load_snapshot(snapshot_path)
-            self.resolver.restore_clock(max_ts)
-            print(f"[HBDB] Snapshot loaded. Clock at {max_ts}.")
+            snapshot_ts = self.backend.load_snapshot(snapshot_path)
+            self.resolver.restore_clock(snapshot_ts)
+            print(f"[HBDB] Snapshot loaded. Clock at {snapshot_ts}.")
 
-        # 2. Replay Log
-        log_path = "transaction.log"
-        if not os.path.exists(log_path):
-            return
+        # 2. Replay Logs.
+        # Archive files exist only if take_snapshot() crashed after
+        # rotating the log: their commits never made it into a snapshot,
+        # so replay them (oldest first) before the live log. Re-applying
+        # an entry the snapshot already holds is idempotent either way.
+        def archive_order(path):
+            suffix = path.rsplit(".", 1)[-1]
+            return int(suffix) if suffix.isdigit() else 0
 
-        print(f"[HBDB] Replaying WAL from {log_path}...")
+        log_paths = sorted(glob.glob("transaction.log.archive.*"), key=archive_order)
+        log_paths.append("transaction.log")
+
         count = 0
         skipped = 0
+        max_ts = snapshot_ts
+        found_log = False
 
-        with open(log_path, "r") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                    ts = entry["ts"]
-                    ops = entry["ops"]
-                    if not isinstance(ts, int) or not isinstance(ops, dict):
-                        raise TypeError("malformed WAL entry")
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    # A torn final line is expected after a crash mid-append;
-                    # anything else corrupt is skipped but counted.
-                    skipped += 1
-                    continue
+        for log_path in log_paths:
+            if not os.path.exists(log_path):
+                continue
+            found_log = True
+            print(f"[HBDB] Replaying WAL from {log_path}...")
 
-                if ts <= max_ts:
-                    continue # Skip already snapshotted
+            with open(log_path, "r") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                        ts = entry["ts"]
+                        ops = entry["ops"]
+                        if not isinstance(ts, int) or not isinstance(ops, dict):
+                            raise TypeError("malformed WAL entry")
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        # A torn final line is expected after a crash mid-append;
+                        # anything else corrupt is skipped but counted.
+                        skipped += 1
+                        continue
 
-                # Apply to backend
-                for k, v in ops.items():
-                    self.backend.write(k, v, ts)
+                    # Skip entries the snapshot already covers. Compare against
+                    # the fixed snapshot baseline, not the running max: commits
+                    # can land in the WAL slightly out of timestamp order, and
+                    # an out-of-order entry is still durable data.
+                    if ts <= snapshot_ts:
+                        continue
 
-                max_ts = ts
-                count += 1
+                    # Apply to backend
+                    for k, v in ops.items():
+                        self.backend.write(k, v, ts)
 
-        # Restore Clock again in case log moved it forward
+                    if ts > max_ts:
+                        max_ts = ts
+                    count += 1
+
+        if not found_log:
+            return
+
+        # Restore Clock again in case the logs moved it forward
         self.resolver.restore_clock(max_ts)
         suffix = f" ({skipped} corrupt lines skipped)" if skipped else ""
         print(f"[HBDB] Replayed {count} transactions from WAL. Clock at {max_ts}.{suffix}")

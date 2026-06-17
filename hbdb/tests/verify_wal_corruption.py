@@ -4,8 +4,11 @@ Commits transactions, injects corrupt lines into the WAL (torn write,
 wrong-shape JSON), then restarts and checks that recovery skips the
 corrupt entries, keeps replaying past them, and applies every valid one.
 """
-from hbdb.db import HBDB
 import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from hbdb.db import HBDB
 
 LOG_FILE = "transaction.log"
 SNAPSHOT_FILE = "snapshot.bin"

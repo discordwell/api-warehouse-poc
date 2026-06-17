@@ -1,7 +1,7 @@
 from typing import List, Dict, Any, Optional
 from ..core.proxy import Transaction
 from ..db import HBDB
-from .catalog import Catalog, Schema
+from .catalog import Catalog
 from .parser import SQLParser
 from .executor import build_physical_plan, ExecutionContext
 from .optimizer import Optimizer, StatsCollector
@@ -16,95 +16,42 @@ class SQLEngine:
 
     def execute(self, sql: str, txn: Optional[Transaction] = None) -> List[Dict[str, Any]]:
         # 1. Transaction Management
+        # On error there is no rollback step: an uncommitted Transaction's
+        # buffered writes are simply discarded with the object.
         local_txn = False
         if txn is None:
             txn = self.db.transaction()
             local_txn = True
 
-        try:
-            # 2. Parse & Bind
-            logical_plan = self.parser.parse(sql)
+        # 2. Parse & Bind
+        logical_plan = self.parser.parse(sql)
 
-            # Handle DDL
-            from .plan import LogicalCreateTable, LogicalCreateIndex
-            from .schema import Schema as TableSchema
-            
-            if isinstance(logical_plan, LogicalCreateTable):
-                schema = TableSchema()
-                # We need to reconstruct schema object from columns
-                # Actually create_table takes Schema object with columns?
-                # parser returns list of columns.
-                # Let's fix create_table in engine to accept list of columns or fix here.
-                # Catalog expects Schema.
-                # Schema expects nothing in init but has add_column?
-                # parser returns LogicalCreateTable with .columns list.
-                
-                # Re-init schema
-                schema = TableSchema() 
-                # Wait, Schema class in schema.py init is empty.
-                # catalog.create_table(name, TableSchema()) then add columns?
-                # catalog.create_table expects Schema object.
-                # Let's populate it.
-                real_schema = TableSchema()
-                # We need to access private members or use public API?
-                # create_table in catalog takes 'schema'.
-                # Let's verify schema.py... 'create_table' in catalog takes 'schema'.
-                # Schema object has no ctor args for columns?
-                # Let's assume we can just pass it.
-                
-                # Actually, Schema doesn't store columns, Table does.
-                # Catalog.create_table(name, schema)... wait.
-                # Table stores columns. Schema manages tables? No.
-                # schema.py: Schema class manages tables. Table class has columns.
-                # Catalog.create_table -> returns Table.
-                # So we should call catalog.create_table with NO schema?
-                # schema.py: "class Schema: Database schema manager. Manages table definitions."
-                # It's misnamed. It's a Catalog-lite.
-                # But catalog.py imports Schema...
-                # Let's look at catalog.py: "class Table: ... schema: Schema".
-                # It denotes the DB schema?
-                
-                # Re-reading schema.py: 
-                # class Schema: def create_table(self, name, columns) -> Table.
-                # class Catalog: def create_table(self, name, schema) -> Table.
-                
-                # This is confusing. 
-                # catalog.py line 35: Table(..., schema=schema).
-                # Here 'schema' seems to be the Database Schema?
-                # But Table also contains columns? schema.py line 38: columns: Dict.
-                
-                # Let's simplify.
-                # In engine.py:50: self.catalog.create_table(name, schema).
-                # But parser returns columns.
-                
-                # Let's assume for this POC we fix engine.create_table to construct the Table properly.
-                self.create_table_from_logical(logical_plan)
-                return [{"status": "Table created"}]
-                
-            if isinstance(logical_plan, LogicalCreateIndex):
-                self.create_index(logical_plan.index_name, logical_plan.table_name, logical_plan.column_name)
-                return [{"status": "Index created"}]
-            
-            # 3. Optimize
-            optimized_plan = self.optimizer.optimize(logical_plan)
-            
-            # 4. Execute
-            ctx = ExecutionContext(txn)
-            plan = build_physical_plan(ctx, optimized_plan, self.catalog)
-            
-            results = list(plan.next())
-            
-            # 5. Commit if local txn
-            if local_txn:
-                if not txn.commit():
-                    raise RuntimeError("Commit failed")
-                    
-            return results
-            
-        except Exception as e:
-            if local_txn:
-                pass
-            raise e
+        # Handle DDL
+        from .plan import LogicalCreateTable, LogicalCreateIndex
+
+        if isinstance(logical_plan, LogicalCreateTable):
+            self.create_table_from_logical(logical_plan)
+            return [{"status": "Table created"}]
+
+        if isinstance(logical_plan, LogicalCreateIndex):
+            self.create_index(logical_plan.index_name, logical_plan.table_name, logical_plan.column_name)
+            return [{"status": "Index created"}]
+
+        # 3. Optimize
+        optimized_plan = self.optimizer.optimize(logical_plan)
+
+        # 4. Execute
+        ctx = ExecutionContext(txn)
+        plan = build_physical_plan(ctx, optimized_plan, self.catalog)
+
+        results = list(plan.next())
+
+        # 5. Commit if local txn
+        if local_txn:
+            if not txn.commit():
+                raise RuntimeError("Commit failed")
+
+        return results
 
     def create_table_from_logical(self, node):
         from .types import Schema as TableDef

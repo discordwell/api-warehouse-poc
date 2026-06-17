@@ -135,11 +135,25 @@ pip install -r requirements.txt
 # pure Python without it
 python setup.py build_ext --inplace
 
+# Everything (each verify script runs in an isolated temp dir):
+python tests/run_all.py               # add --skip-cluster to avoid ports 9000-9004
+```
+
+Individual suites can also be run directly:
+
+```bash
 # Calvin engine suite
 python tests/test_hbdb.py
 
 # Resolver (OCC) suite, incl. the pure-Python fallback path
 python tests/test_resolver.py
+
+# Snapshot + recovery suite (pure-Python path, native cross-compatibility,
+# WAL archive replay)
+python tests/test_snapshot.py
+
+# Storage facade contracts (tombstone scans, out-of-order MVCC writes)
+python tests/test_backend.py
 
 # FDB-style engine verification scripts (write WAL/snapshot files to CWD)
 python tests/verify_durability.py

@@ -11,6 +11,14 @@ import subprocess
 import time
 import sys
 import os
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+# Spawned servers import hbdb via `python -m`, so they need the repo root
+# on their path too, regardless of the CWD this script runs from.
+SERVER_ENV = {**os.environ, "PYTHONPATH": os.pathsep.join(
+    p for p in (REPO_ROOT, os.environ.get("PYTHONPATH")) if p)}
+
 from hbdb.db import HBDB
 from hbdb.core.topology import ClusterTopology
 
@@ -23,21 +31,21 @@ def test_replication():
     
     for p in ports:
         proc = subprocess.Popen([
-            sys.executable, "-m", "hbdb.server.main", 
+            sys.executable, "-m", "hbdb.server.main",
             "--role", "storage", "--port", str(p)
-        ])
+        ], env=SERVER_ENV)
         procs.append(proc)
     
     storage_nodes = ",".join([f"127.0.0.1:{p}" for p in ports])
     
     # 2. Start Coordinator
     coord = subprocess.Popen([
-        sys.executable, "-m", "hbdb.server.main", 
-        "--role", "coordinator", 
+        sys.executable, "-m", "hbdb.server.main",
+        "--role", "coordinator",
         "--port", "9000",
         "--storage-nodes", storage_nodes,
         "--rf", "2"
-    ])
+    ], env=SERVER_ENV)
     
     time.sleep(3) # Wait for startup
     

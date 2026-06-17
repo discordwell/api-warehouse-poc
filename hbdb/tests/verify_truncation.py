@@ -1,9 +1,12 @@
 """
 Verify Snapshot + Log Truncation.
 """
-from hbdb.db import HBDB
 import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import json
+from hbdb.db import HBDB
 
 def verify_truncation():
     print("Verifying Snapshot & Truncation...")

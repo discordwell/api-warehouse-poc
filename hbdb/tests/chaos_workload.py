@@ -3,10 +3,12 @@ Chaos Workload.
 Continuously increments a counter in HBDB.
 Used by chaos_monkey.py.
 """
-from hbdb.db import HBDB
 import time
 import sys
 import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from hbdb.db import HBDB
 
 def run():
     db = HBDB()

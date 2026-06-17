@@ -3,8 +3,12 @@ Verify Range-Based Conflict Detection.
 Tests that standard read-write conflicts are detected, AND new "Phantom Read" conflicts
 (inserting into a scanned range) are detected.
 """
-from hbdb.db import HBDB
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import time
+from hbdb.db import HBDB
 
 def verify_range_conflict():
     print("Verifying Range Conflict Detection...")

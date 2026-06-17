@@ -1,6 +1,10 @@
 """
 Verify SQL Index Scan optimization.
 """
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from hbdb.db import HBDB
 from hbdb.sql.engine import SQLEngine
 from hbdb.sql.schema import Column, DataType
@@ -60,6 +64,21 @@ def verify_index():
     else:
         print("❌ FAILURE: Index keys missing.")
         print(keys)
+        exit(1)
+
+    # 5. DELETE writes a None tombstone; SELECT must skip it
+    # (regression: the native scan used to return the tombstone and
+    # crash row decoding)
+    print("Step 5: DELETE then SELECT...")
+    engine.execute("DELETE FROM users WHERE id = 1")
+    remaining = list(engine.execute("SELECT id, name, age FROM users"))
+    ids = sorted(row['id'] for row in remaining)
+
+    if ids == [2, 3, 4]:
+        print("✅ SUCCESS: Deleted row no longer visible.")
+    else:
+        print(f"❌ FAILURE: Expected ids [2, 3, 4], got {ids}")
+        exit(1)
 
 if __name__ == "__main__":
     verify_index()
