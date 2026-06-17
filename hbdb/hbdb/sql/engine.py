@@ -53,10 +53,18 @@ class SQLEngine:
 
         return results
 
+    def create_table(self, name: str, schema):
+        """Create a table from a Schema object (programmatic DDL).
+
+        Complements the SQL ``CREATE TABLE`` path so callers can build a
+        schema directly without round-tripping through SQL text.
+        """
+        return self.catalog.create_table(name, schema)
+
     def create_table_from_logical(self, node):
         from .types import Schema as TableDef
         table_def = TableDef(columns=node.columns)
-        self.catalog.create_table(node.table_name, table_def)
+        self.create_table(node.table_name, table_def)
 
     def create_index(self, index_name: str, table_name: str, column_name: str):
         """Create a secondary index on a table column."""

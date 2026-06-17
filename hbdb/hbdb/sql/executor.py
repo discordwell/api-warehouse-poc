@@ -1,15 +1,11 @@
 from typing import Iterator, Any, Dict, List, Tuple
 from abc import ABC, abstractmethod
-from functools import lru_cache
-from .plan import (LogicalNode, LogicalScan, LogicalFilter, LogicalProject, 
+from .plan import (LogicalNode, LogicalScan, LogicalFilter, LogicalProject,
                    LogicalInsert, LogicalUpdate, LogicalDelete, LogicalJoin)
 from .encoding import KeyEncoder
+from .predicates import evaluate as eval_predicate, resolve as resolve_operand
 from ..core.proxy import Transaction
 from ..core.cache import get_read_cache
-
-# Query result cache for expensive operations like JOINs
-_query_cache: Dict[str, List[Dict[str, Any]]] = {}
-_query_cache_max_size = 100
 
 class ExecutionContext:
     def __init__(self, txn: Transaction):
@@ -57,44 +53,9 @@ class FilterExecutor(PhysicalOperator):
 
     def next(self) -> Iterator[Dict[str, Any]]:
         condition = self.node.condition
-        # For POC, condition is a sqlglot expression.
-        # We need to evaluate it against the row.
-        # Creating a simplified python eval shim.
-        
         for row in self.child.next():
-            if self._evaluate(condition, row):
+            if eval_predicate(condition, row):
                 yield row
-
-    def _evaluate(self, condition, row):
-        # The condition is a Where node containing the actual predicate
-        from sqlglot import exp
-        try:
-            # Unwrap Where if needed
-            if isinstance(condition, exp.Where):
-                condition = condition.this
-            
-            if isinstance(condition, exp.EQ):
-                # Get column name from left side
-                col = condition.left.name if hasattr(condition.left, 'name') else str(condition.left)
-                
-                # Get value from right side (Literal)
-                right = condition.right
-                if isinstance(right, exp.Literal):
-                    val = right.this  # The actual value
-                else:
-                    val = right.name if hasattr(right, 'name') else str(right)
-                
-                row_val = row.get(col)
-                # Type-aware comparison
-                if isinstance(row_val, int):
-                    try:
-                        return row_val == int(val)
-                    except:
-                        return str(row_val) == str(val)
-                return str(row_val) == str(val)
-            return True  # Fallback for unsupported predicates
-        except Exception as e:
-            return True
 
 class InsertExecutor(PhysicalOperator):
     def __init__(self, ctx: ExecutionContext, node: LogicalInsert, catalog=None):
@@ -160,7 +121,7 @@ class UpdateExecutor(PhysicalOperator):
             row[pk_name] = int(pk_val) if pk_val.isdigit() else pk_val
 
             # 2. Filter by condition
-            if self._matches(self.node.condition, row):
+            if eval_predicate(self.node.condition, row):
                 # Capture indexed values before mutating so we can rewrite
                 # any secondary-index entry whose key changed.
                 old_indexed = {idx.id: row.get(idx.column_name) for idx in indexes}
@@ -171,7 +132,7 @@ class UpdateExecutor(PhysicalOperator):
                         row[col] = new_val
                     else:
                         # Expression evaluation (e.g., balance + 10)
-                        row[col] = self._eval_expr(new_val, row)
+                        row[col] = resolve_operand(new_val, row)
 
                 # 4. Write back
                 new_val_enc = KeyEncoder.encode_row_value(row)
@@ -201,33 +162,6 @@ class UpdateExecutor(PhysicalOperator):
                     self.node.table_id, idx.id, new_v, pk_val)
                 self.ctx.txn.set(new_key, str(pk_val))
 
-    def _matches(self, condition, row):
-        if condition is None: return True
-        from sqlglot import exp
-        if isinstance(condition, exp.Where):
-            condition = condition.this
-        if isinstance(condition, exp.EQ):
-            col = condition.left.name
-            val = condition.right.this if hasattr(condition.right, 'this') else str(condition.right)
-            row_val = row.get(col)
-            if isinstance(row_val, int):
-                try: return row_val == int(val)
-                except: pass
-            return str(row_val) == str(val)
-        return True
-
-    def _eval_expr(self, expr, row):
-        from sqlglot import exp
-        if isinstance(expr, exp.Add):
-            left = row.get(expr.left.name) if hasattr(expr.left, 'name') else int(expr.left.this)
-            right = int(expr.right.this) if hasattr(expr.right, 'this') else row.get(expr.right.name)
-            return left + right
-        elif isinstance(expr, exp.Sub):
-            left = row.get(expr.left.name) if hasattr(expr.left, 'name') else int(expr.left.this)
-            right = int(expr.right.this) if hasattr(expr.right, 'this') else row.get(expr.right.name)
-            return left - right
-        return expr
-
 class DeleteExecutor(PhysicalOperator):
     def __init__(self, ctx: ExecutionContext, node: LogicalDelete, catalog=None):
         self.ctx = ctx
@@ -252,7 +186,7 @@ class DeleteExecutor(PhysicalOperator):
             pk_val = KeyEncoder.decode_row_pk(key)
             row[pk_name] = int(pk_val) if pk_val.isdigit() else pk_val
 
-            if self._matches(self.node.condition, row):
+            if eval_predicate(self.node.condition, row):
                 # Delete by writing a None tombstone; scans filter these out.
                 self.ctx.txn.set(key, None)
                 # The read cache is not write-through; drop the stale decode.
@@ -269,21 +203,6 @@ class DeleteExecutor(PhysicalOperator):
                 count += 1
 
         yield {"count": count}
-
-    def _matches(self, condition, row):
-        if condition is None: return True
-        from sqlglot import exp
-        if isinstance(condition, exp.Where):
-            condition = condition.this
-        if isinstance(condition, exp.EQ):
-            col = condition.left.name
-            val = condition.right.this if hasattr(condition.right, 'this') else str(condition.right)
-            row_val = row.get(col)
-            if isinstance(row_val, int):
-                try: return row_val == int(val)
-                except: pass
-            return str(row_val) == str(val)
-        return True
 
 class NestedLoopJoinExecutor(PhysicalOperator):
     def __init__(self, left: PhysicalOperator, right: PhysicalOperator, node: LogicalJoin):
@@ -311,25 +230,15 @@ class NestedLoopJoinExecutor(PhysicalOperator):
         return True
 
 class HashJoinExecutor(PhysicalOperator):
-    """Hash Join - builds hash table on right, probes with left. Supports result caching."""
+    """Hash Join - builds a hash table on the right input, probes with the left."""
     def __init__(self, left: PhysicalOperator, right: PhysicalOperator, node: LogicalJoin):
         self.left = left
         self.right = right
         self.node = node
-        # Generate cache key from node structure
-        self._cache_key = f"join:{id(node.left)}:{id(node.right)}:{str(node.condition)}"
 
     def next(self) -> Iterator[Dict[str, Any]]:
-        global _query_cache
-        
-        # Check cache first
-        if self._cache_key in _query_cache:
-            for row in _query_cache[self._cache_key]:
-                yield row
-            return
-        
         from sqlglot import exp
-        
+
         # Get join columns
         condition = self.node.condition
         if not isinstance(condition, exp.EQ):
@@ -337,32 +246,21 @@ class HashJoinExecutor(PhysicalOperator):
             for row in NestedLoopJoinExecutor(self.left, self.right, self.node).next():
                 yield row
             return
-        
+
         r_col = condition.right.name
         l_col = condition.left.name
-        
+
         # Build phase: hash the right side
         hash_table = {}
         for r_row in self.right.next():
             key = r_row.get(r_col)
-            if key not in hash_table:
-                hash_table[key] = []
-            hash_table[key].append(r_row)
-        
+            hash_table.setdefault(key, []).append(r_row)
+
         # Probe phase: scan left and probe hash table
-        results = []
         for l_row in self.left.next():
             key = l_row.get(l_col)
-            matches = hash_table.get(key, [])
-            for r_row in matches:
-                merged = {**l_row, **r_row}
-                results.append(merged)
-                yield merged
-        
-        # Cache results (LRU eviction if at capacity)
-        if len(_query_cache) >= _query_cache_max_size:
-            _query_cache.pop(next(iter(_query_cache)))
-        _query_cache[self._cache_key] = results
+            for r_row in hash_table.get(key, []):
+                yield {**l_row, **r_row}
 
 
 class IndexScanExecutor(PhysicalOperator):
@@ -394,6 +292,23 @@ class IndexScanExecutor(PhysicalOperator):
                 row[pk_name] = int(pk_val) if pk_val.isdigit() else pk_val
                 yield row
 
+
+class ProjectExecutor(PhysicalOperator):
+    """Restrict each row to the projected columns (SELECT col list).
+
+    Without this, ``SELECT name FROM users`` returned every column because
+    projection was a no-op. ``SELECT *`` never builds a Project node, so it
+    streams all columns through unchanged.
+    """
+    def __init__(self, child: PhysicalOperator, node: LogicalProject):
+        self.child = child
+        self.columns = node.column_names
+
+    def next(self) -> Iterator[Dict[str, Any]]:
+        for row in self.child.next():
+            yield {col: row.get(col) for col in self.columns}
+
+
 def build_physical_plan(ctx: ExecutionContext, logical: LogicalNode, catalog=None) -> PhysicalOperator:
     if isinstance(logical, LogicalScan):
         # Check if index scan is possible
@@ -404,6 +319,8 @@ def build_physical_plan(ctx: ExecutionContext, logical: LogicalNode, catalog=Non
             if target_idx:
                 return IndexScanExecutor(ctx, logical, target_idx, logical.lookup_value)
         return TableScanExecutor(ctx, logical)
+    elif isinstance(logical, LogicalProject):
+        return ProjectExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
     elif isinstance(logical, LogicalFilter):
         return FilterExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
     elif isinstance(logical, LogicalInsert):

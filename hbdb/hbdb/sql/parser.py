@@ -126,12 +126,17 @@ class SQLParser:
         if node.args.get("where"):
             root = LogicalFilter(children=[root], schema=root.schema, condition=node.args.get("where"))
 
-        # Bind SELECT (Project)
+        # Bind SELECT (Project). Only project plain column lists; SELECT *,
+        # aggregates, functions and aliased expressions stream through with
+        # all columns (projecting them by `.name` would mangle the result).
         projections = node.expressions
-        if not (len(projections) == 1 and isinstance(projections[0], exp.Star)):
+        is_star = len(projections) == 1 and isinstance(projections[0], exp.Star)
+        if not is_star and projections and all(
+            isinstance(p, (exp.Column, exp.Identifier)) for p in projections
+        ):
             col_names = [p.name for p in projections]
             root = LogicalProject(children=[root], schema=root.schema, column_names=col_names)
-            
+
         return root
 
     def _bind_select_with_join(self, node: exp.Select, joins) -> LogicalNode:

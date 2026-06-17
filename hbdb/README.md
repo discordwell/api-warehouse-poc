@@ -187,3 +187,10 @@ python examples/benchmark.py
 (The FDB-style engine's SQL layer additionally supports `CREATE INDEX`
 with index-scan execution; see `hbdb/sql/engine.py` and
 `tests/verify_sql_index.py`.)
+
+`WHERE` clauses in the FDB-style engine support `=`, `!=`/`<>`, `<`, `<=`,
+`>`, `>=`, `AND`, `OR`, `NOT`, parentheses, `IS [NOT] NULL` and `IN`, with
+SQL three-valued (NULL) logic; predicate evaluation lives in
+`hbdb/sql/predicates.py` and is shared by the filter/update/delete operators
+(`tests/verify_sql_predicates.py`). `SELECT col, ...` projects to the listed
+columns; `SELECT *` returns all.
