@@ -167,6 +167,7 @@ python tests/verify_sql_predicates.py
 python tests/verify_sql_insert.py
 python tests/verify_sql_orderlimit.py
 python tests/verify_sql_aggregates.py
+python tests/verify_sql_join.py
 
 # Cluster integration (spawns local coordinator + storage subprocesses)
 python tests/verify_sharding.py
@@ -188,6 +189,8 @@ python examples/benchmark.py
 - `SELECT ... GROUP BY` with aggregate functions (`COUNT`, `SUM`, `AVG`,
   `MIN`, `MAX`, including `COUNT(DISTINCT col)`) and `HAVING`
 - `SELECT DISTINCT`
+- `JOIN` (`INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, `CROSS`, and comma joins),
+  including multi-table and self-joins
 - `UPDATE` (with WHERE)
 - `DELETE` (with WHERE)
 
@@ -229,6 +232,24 @@ guessed. Aggregate arguments and group keys resolve through the same operand
 resolver as `WHERE`/`ORDER BY`, so `SUM(price * qty)` and numeric-string columns
 behave consistently. Unaliased aggregate output columns are named by their SQL
 text (e.g. `COUNT(*)`); alias them (`COUNT(*) AS n`) for friendlier keys.
+
+`JOIN` is implemented in `hbdb/sql/parser.py` (binding) and the
+`JoinExecutor`/`QualifyExecutor` operators (`tests/verify_sql_join.py`).
+`INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, `CROSS` and comma joins are supported,
+including chained multi-table joins and self-joins via table aliases
+(`FROM emp e JOIN emp m ON e.mgr_id = m.id`). The full `ON` predicate is
+evaluated through the shared operand resolver, so it works regardless of which
+side of `=` each column sits on and supports non-equi (`a.x < b.y`) and
+compound (`... AND ...`) conditions; outer joins NULL-pad unmatched rows.
+Merged rows carry `table.col` keys, so same-named columns from different
+tables (the ubiquitous `id`) coexist instead of clobbering each other —
+reference them qualified (`users.id`), and `SELECT *` keeps both under their
+qualified names. `NULL` never equi-joins (SQL's `NULL = NULL` is UNKNOWN), on
+both the hash-join fast path (INNER equi-joins) and the nested-loop path. An
+*unqualified* reference to a column that exists in more than one joined table
+is **ambiguous and fails loud** (`ValueError`), as do two SELECT items that
+would land on the same output key (`SELECT a.id, b.id` — alias one), rather
+than silently picking a side.
 
 Clauses the engine still does not implement — window/analytic functions
 (`ROW_NUMBER() OVER (...)`) and aggregates beyond the five above (`STDDEV`, ...)

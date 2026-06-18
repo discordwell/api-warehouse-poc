@@ -153,7 +153,19 @@ def _resolve(node, row):
         return _arith(node, row, lambda a, b: a * b)
     if isinstance(node, exp.Div):
         return _arith(node, row, lambda a, b: a / b if b else None)
-    if isinstance(node, (exp.Column, exp.Identifier)):
+    if isinstance(node, exp.Column):
+        # Honor a table qualifier when the row carries qualified keys (join
+        # rows hold both "table.col" and the bare "col"). For single-table
+        # rows the qualified key is absent, so this falls back to the bare
+        # name -- identical to the pre-join behavior. Resolving the qualifier
+        # is what lets `users.id` and `orders.id` coexist in one joined row.
+        table = node.table
+        if table:
+            qualified = f"{table}.{node.name}"
+            if qualified in row:
+                return row[qualified]
+        return row.get(node.name)
+    if isinstance(node, exp.Identifier):
         return row.get(node.name)
     # An unrecognized expression (function call, CAST, %, ||, ...): fail
     # loudly rather than silently mis-resolving it to a column lookup,

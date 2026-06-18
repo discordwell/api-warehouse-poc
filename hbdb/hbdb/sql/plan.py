@@ -13,6 +13,11 @@ class LogicalScan(LogicalNode):
     table_id: int
     index_id: Optional[int] = None
     lookup_value: Any = None
+    # When set (only in the JOIN path), the scan's rows are emitted with both
+    # their bare column names and "qualify.col" keys, so columns from
+    # different tables can coexist in one merged row even when their names
+    # collide. None for single-table queries -> bare keys only (unchanged).
+    qualify: Optional[str] = None
 
 @dataclass
 class LogicalFilter(LogicalNode):
@@ -23,6 +28,16 @@ class LogicalFilter(LogicalNode):
 @dataclass
 class LogicalProject(LogicalNode):
     column_names: List[str]
+
+@dataclass
+class LogicalProjectExprs(LogicalNode):
+    # Expression-based projection used by the JOIN path: each entry is
+    # (out_name, expr) where expr is a sqlglot operand resolved per (merged)
+    # row through the shared operand resolver. Unlike LogicalProject (a plain
+    # column-name restriction for single-table SELECTs), this can pull
+    # table-qualified columns (users.id vs orders.id) and evaluate
+    # expressions, which a flat column-name list cannot express.
+    projections: List[Any]
 
 @dataclass
 class LogicalSort(LogicalNode):
@@ -85,8 +100,20 @@ class LogicalDelete(LogicalNode):
 class LogicalJoin(LogicalNode):
     left: 'LogicalNode'
     right: 'LogicalNode'
-    join_type: str  # INNER, LEFT, etc.
-    condition: Any  # ON clause
+    join_type: str  # INNER, LEFT, RIGHT, FULL (CROSS/comma -> condition is None)
+    condition: Any  # ON clause (None for CROSS / comma join)
+    # (left_key_expr, right_key_expr) when the ON clause is a single equi-join
+    # whose two columns can be assigned to the left and right inputs; enables
+    # the hash-join fast path for INNER joins. None -> evaluate the full ON
+    # predicate with a nested loop (handles non-equi / compound ON, and is
+    # always correct).
+    hash_keys: Any = None
+    # Pre-computed NULL-padding dicts for outer joins: left_pad sets every
+    # left-side key to None (used when a RIGHT/FULL row has no left match);
+    # right_pad sets every right-side key to None (used when a LEFT/FULL row
+    # has no right match). None for inner/cross joins, which never pad.
+    left_pad: Any = None
+    right_pad: Any = None
 
 @dataclass
 class LogicalCreateTable(LogicalNode):

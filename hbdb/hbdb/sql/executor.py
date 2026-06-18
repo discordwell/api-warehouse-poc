@@ -2,8 +2,9 @@ import functools
 from typing import Iterator, Any, Dict, List, Tuple
 from abc import ABC, abstractmethod
 from .plan import (LogicalNode, LogicalScan, LogicalFilter, LogicalProject,
-                   LogicalInsert, LogicalUpdate, LogicalDelete, LogicalJoin,
-                   LogicalSort, LogicalLimit, LogicalAggregate, LogicalDistinct)
+                   LogicalProjectExprs, LogicalInsert, LogicalUpdate,
+                   LogicalDelete, LogicalJoin, LogicalSort, LogicalLimit,
+                   LogicalAggregate, LogicalDistinct)
 from .encoding import KeyEncoder
 from .predicates import (evaluate as eval_predicate, resolve as resolve_operand,
                          compare_values, distinct_key)
@@ -212,63 +213,120 @@ class DeleteExecutor(PhysicalOperator):
 
         yield {"count": count}
 
-class NestedLoopJoinExecutor(PhysicalOperator):
+class QualifyExecutor(PhysicalOperator):
+    """Add ``table.col`` keys to every row of a base scan feeding a JOIN.
+
+    A row from the storage scan is keyed by bare column names. Two joined
+    tables can share a column name (``id``), so the merged row would silently
+    lose one side. Emitting each column under both its bare name and a
+    ``qualify.col`` name lets ``users.id`` and ``orders.id`` coexist; the
+    shared operand resolver honors the qualifier (see ``predicates._resolve``),
+    and bare references to a colliding name are rejected at bind time. The
+    bare keys are kept so non-colliding columns can still be referenced
+    unqualified. Operates on a copy -- the scan's read cache only ever sees
+    bare rows.
+
+    A qualified key is emitted for *every* schema column, defaulting an absent
+    (NULL/unset) column to None. This is essential: without it a missing
+    column would have no ``table.col`` key, and a qualified reference would
+    fall back to the bare name -- which on a collision holds the *other*
+    table's value, silently matching rows that should not join.
+    """
+    def __init__(self, child: PhysicalOperator, qualify: str, columns: List[str]):
+        self.child = child
+        self.prefix = qualify + "."
+        self.columns = columns
+
+    def next(self) -> Iterator[Dict[str, Any]]:
+        prefix = self.prefix
+        for row in self.child.next():
+            out = dict(row)
+            for col in self.columns:
+                out[prefix + col] = row.get(col)
+            yield out
+
+
+class JoinExecutor(PhysicalOperator):
+    """INNER / LEFT / RIGHT / FULL OUTER / CROSS join over flat merged rows.
+
+    Correctness over the old executors:
+      * The full ON predicate is evaluated via the shared ``predicates``
+        module (so non-equi and compound ``ON`` conditions work, and column
+        references resolve by qualifier -- the join no longer depends on which
+        side of ``=`` each column was written on).
+      * Outer joins emit NULL-padded rows for unmatched tuples instead of
+        silently degrading to an inner join.
+      * Merged rows carry ``table.col`` keys (from ``QualifyExecutor``), so
+        same-named columns from different tables no longer clobber each other.
+
+    INNER equi-joins with classifiable key columns take a hash-join fast path
+    (build on the right input, probe with the left); everything else uses a
+    nested loop, which is always correct. Hash keys use the engine's value
+    equality (``distinct_key``) so ``"1"`` and ``1`` match as they do under a
+    nested-loop ``ON`` comparison.
+    """
     def __init__(self, left: PhysicalOperator, right: PhysicalOperator, node: LogicalJoin):
         self.left = left
         self.right = right
         self.node = node
 
     def next(self) -> Iterator[Dict[str, Any]]:
-        left_rows = list(self.left.next())
+        jt = (self.node.join_type or "INNER").upper()
+        cond = self.node.condition
         right_rows = list(self.right.next())
-        
-        for l_row in left_rows:
-            for r_row in right_rows:
-                if self._matches_join(l_row, r_row, self.node.condition):
-                    merged = {**l_row, **r_row}
-                    yield merged
 
-    def _matches_join(self, left, right, condition):
-        if condition is None: return True
-        from sqlglot import exp
-        if isinstance(condition, exp.EQ):
-            l_col = condition.left.name
-            r_col = condition.right.name
-            return left.get(l_col) == right.get(r_col)
-        return True
-
-class HashJoinExecutor(PhysicalOperator):
-    """Hash Join - builds a hash table on the right input, probes with the left."""
-    def __init__(self, left: PhysicalOperator, right: PhysicalOperator, node: LogicalJoin):
-        self.left = left
-        self.right = right
-        self.node = node
-
-    def next(self) -> Iterator[Dict[str, Any]]:
-        from sqlglot import exp
-
-        # Get join columns
-        condition = self.node.condition
-        if not isinstance(condition, exp.EQ):
-            # Fallback to nested loop
-            for row in NestedLoopJoinExecutor(self.left, self.right, self.node).next():
-                yield row
+        # CROSS / comma join: cartesian product, no predicate.
+        if cond is None:
+            for l_row in self.left.next():
+                for r_row in right_rows:
+                    yield {**l_row, **r_row}
             return
 
-        r_col = condition.right.name
-        l_col = condition.left.name
+        if jt == "INNER" and self.node.hash_keys is not None:
+            yield from self._hash_inner(right_rows)
+        else:
+            yield from self._nested(right_rows, jt)
 
-        # Build phase: hash the right side
-        hash_table = {}
-        for r_row in self.right.next():
-            key = r_row.get(r_col)
-            hash_table.setdefault(key, []).append(r_row)
-
-        # Probe phase: scan left and probe hash table
+    def _hash_inner(self, right_rows) -> Iterator[Dict[str, Any]]:
+        left_expr, right_expr = self.node.hash_keys
+        table: Dict[Any, List[Dict[str, Any]]] = {}
+        for r_row in right_rows:
+            kv = resolve_operand(right_expr, r_row)
+            # NULL never equi-joins: `NULL = NULL` is UNKNOWN, not true. Skip
+            # NULL keys so the hash path matches the nested-loop ON evaluation
+            # (which excludes them via three-valued logic) instead of bucketing
+            # all NULLs together and joining them.
+            if kv is None:
+                continue
+            table.setdefault(distinct_key(kv), []).append(r_row)
         for l_row in self.left.next():
-            key = l_row.get(l_col)
-            for r_row in hash_table.get(key, []):
+            kv = resolve_operand(left_expr, l_row)
+            if kv is None:
+                continue
+            for r_row in table.get(distinct_key(kv), []):
                 yield {**l_row, **r_row}
+
+    def _nested(self, right_rows, jt) -> Iterator[Dict[str, Any]]:
+        cond = self.node.condition
+        right_pad = self.node.right_pad or {}
+        left_pad = self.node.left_pad or {}
+        right_matched = [False] * len(right_rows)
+
+        for l_row in self.left.next():
+            matched = False
+            for i, r_row in enumerate(right_rows):
+                merged = {**l_row, **r_row}
+                if eval_predicate(cond, merged) is True:
+                    matched = True
+                    right_matched[i] = True
+                    yield merged
+            if not matched and jt in ("LEFT", "FULL"):
+                yield {**l_row, **right_pad}
+
+        if jt in ("RIGHT", "FULL"):
+            for i, r_row in enumerate(right_rows):
+                if not right_matched[i]:
+                    yield {**left_pad, **r_row}
 
 
 class IndexScanExecutor(PhysicalOperator):
@@ -315,6 +373,23 @@ class ProjectExecutor(PhysicalOperator):
     def next(self) -> Iterator[Dict[str, Any]]:
         for row in self.child.next():
             yield {col: row.get(col) for col in self.columns}
+
+
+class ProjectExprsExecutor(PhysicalOperator):
+    """Expression-based projection for the JOIN path (LogicalProjectExprs).
+
+    Each projection is ``(out_name, expr)``; the value is resolved per row by
+    the shared operand resolver, so qualified columns (``users.id``) and
+    expressions (``price * qty``) project correctly. Output names are unique
+    by construction (the parser rejects duplicates at bind time).
+    """
+    def __init__(self, child: PhysicalOperator, node: LogicalProjectExprs):
+        self.child = child
+        self.projections = node.projections
+
+    def next(self) -> Iterator[Dict[str, Any]]:
+        for row in self.child.next():
+            yield {name: resolve_operand(expr, row) for name, expr in self.projections}
 
 
 class SortExecutor(PhysicalOperator):
@@ -458,15 +533,27 @@ class DistinctExecutor(PhysicalOperator):
 def build_physical_plan(ctx: ExecutionContext, logical: LogicalNode, catalog=None) -> PhysicalOperator:
     if isinstance(logical, LogicalScan):
         # Check if index scan is possible
+        scan: PhysicalOperator
         if logical.index_id is not None and catalog:
             # Find the specific index object
             indexes = catalog.get_indexes_for_table(logical.table_id)
             target_idx = next((idx for idx in indexes if idx.id == logical.index_id), None)
             if target_idx:
-                return IndexScanExecutor(ctx, logical, target_idx, logical.lookup_value)
-        return TableScanExecutor(ctx, logical)
+                scan = IndexScanExecutor(ctx, logical, target_idx, logical.lookup_value)
+            else:
+                scan = TableScanExecutor(ctx, logical)
+        else:
+            scan = TableScanExecutor(ctx, logical)
+        # In the JOIN path the scan is tagged with a qualifier so its rows
+        # also carry table.col keys; single-table scans leave qualify None.
+        if logical.qualify:
+            columns = [c.name for c in logical.schema.columns]
+            return QualifyExecutor(scan, logical.qualify, columns)
+        return scan
     elif isinstance(logical, LogicalProject):
         return ProjectExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
+    elif isinstance(logical, LogicalProjectExprs):
+        return ProjectExprsExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
     elif isinstance(logical, LogicalAggregate):
         return AggregateExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
     elif isinstance(logical, LogicalDistinct):
@@ -486,11 +573,7 @@ def build_physical_plan(ctx: ExecutionContext, logical: LogicalNode, catalog=Non
     elif isinstance(logical, LogicalJoin):
         left_op = build_physical_plan(ctx, logical.left, catalog)
         right_op = build_physical_plan(ctx, logical.right, catalog)
-        # Use Hash Join for equi-joins, Nested Loop otherwise
-        from sqlglot import exp
-        if isinstance(logical.condition, exp.EQ):
-            return HashJoinExecutor(left_op, right_op, logical)
-        return NestedLoopJoinExecutor(left_op, right_op, logical)
+        return JoinExecutor(left_op, right_op, logical)
     else:
         if logical.children:
             return build_physical_plan(ctx, logical.children[0], catalog)
