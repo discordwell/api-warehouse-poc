@@ -166,6 +166,7 @@ python tests/verify_sql_index.py
 python tests/verify_sql_predicates.py
 python tests/verify_sql_insert.py
 python tests/verify_sql_orderlimit.py
+python tests/verify_sql_aggregates.py
 
 # Cluster integration (spawns local coordinator + storage subprocesses)
 python tests/verify_sharding.py
@@ -184,6 +185,9 @@ python examples/benchmark.py
 - `DROP TABLE`
 - `INSERT INTO` (single- and multi-row `VALUES (..), (..), ..`)
 - `SELECT` (with WHERE, column projection, `ORDER BY`, `LIMIT`/`OFFSET`)
+- `SELECT ... GROUP BY` with aggregate functions (`COUNT`, `SUM`, `AVG`,
+  `MIN`, `MAX`, including `COUNT(DISTINCT col)`) and `HAVING`
+- `SELECT DISTINCT`
 - `UPDATE` (with WHERE)
 - `DELETE` (with WHERE)
 
@@ -210,7 +214,24 @@ the FDB-style engine; sort keys resolve through the shared operand resolver,
 so they use the same numeric/string coercion as `WHERE`
 (`tests/verify_sql_orderlimit.py`). NULL ordering follows SQL's "NULL is the
 smallest value" default unless an explicit `NULLS FIRST`/`LAST` is given.
-Clauses the engine does not implement yet — `GROUP BY`, `HAVING`,
-`DISTINCT` and aggregate functions (`COUNT`, `SUM`, ...) — raise
-`NotImplementedError` rather than silently dropping the clause and returning
-the wrong rows (the same fail-loud contract the `WHERE` evaluator uses).
+
+`GROUP BY` and aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`,
+including `COUNT(DISTINCT col)` and `SUM(DISTINCT col)`), `HAVING`, and
+`SELECT DISTINCT` are implemented in `hbdb/sql/aggregates.py` and the
+`AggregateExecutor`/`DistinctExecutor` operators (`tests/verify_sql_aggregates.py`).
+Grouping supports multiple keys and positional `GROUP BY 1`; `HAVING` may
+reference aggregates that are not in the SELECT list; `ORDER BY` can sort by an
+aggregate or alias (`... GROUP BY dept ORDER BY COUNT(*) DESC`). SQL NULL rules
+are honored: `COUNT(*)` counts rows while `COUNT(col)` and `SUM`/`AVG`/`MIN`/`MAX`
+skip NULLs, a global aggregate over an empty table still returns one row, and a
+non-aggregated column that is not a `GROUP BY` key is rejected rather than
+guessed. Aggregate arguments and group keys resolve through the same operand
+resolver as `WHERE`/`ORDER BY`, so `SUM(price * qty)` and numeric-string columns
+behave consistently. Unaliased aggregate output columns are named by their SQL
+text (e.g. `COUNT(*)`); alias them (`COUNT(*) AS n`) for friendlier keys.
+
+Clauses the engine still does not implement — window/analytic functions
+(`ROW_NUMBER() OVER (...)`) and aggregates beyond the five above (`STDDEV`, ...)
+— raise `NotImplementedError` rather than silently dropping the clause and
+returning the wrong rows (the same fail-loud contract the `WHERE` evaluator
+uses).

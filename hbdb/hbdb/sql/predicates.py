@@ -183,14 +183,45 @@ def _coerce_pair(a, b):
     return a, b
 
 
-def coerce_pair(a, b):
-    """Public alias of the numeric-coercion helper.
+def as_number(value):
+    """Public alias of the numeric coercion used by WHERE/ORDER BY.
 
-    Shared with the ORDER BY comparator (``sql/executor.py``) so sorting uses
-    the same number/string coercion as WHERE comparisons -- e.g. the string
-    ``"9"`` sorts before ``"10"`` numerically rather than lexicographically.
-    """
-    return _coerce_pair(a, b)
+    Shared with the aggregate operators (``sql/aggregates.py``) so SUM/AVG add
+    up numeric strings the same way a comparison would. Returns an int/float,
+    or None when ``value`` is not numeric (booleans included)."""
+    return _as_number(value)
+
+
+def distinct_key(value):
+    """A hashable identity for DISTINCT / de-duplication that matches the
+    engine's value equality.
+
+    Numeric values (including numeric strings) key on their number, so ``1``
+    and ``1.0`` -- and ``10`` and ``"10"`` -- are one value, consistent with
+    how WHERE/ORDER BY coerce them. Booleans stay distinct from ints
+    (``TRUE`` is not ``1``), since ``as_number`` excludes bools. ``None`` keys
+    on itself, so all NULLs collapse to one (SQL treats NULLs as equal for
+    DISTINCT)."""
+    n = _as_number(value)
+    if n is not None:
+        return ("n", n)
+    return (type(value).__name__, value)
+
+
+def compare_values(a, b) -> int:
+    """Three-way compare (-1/0/1) using the WHERE/ORDER BY coercion rules.
+
+    Both operands are coerced as a pair (numeric strings compare as numbers),
+    then ordered. Genuinely incomparable values (e.g. a number vs non-numeric
+    text) fall back to a stable string compare instead of raising -- the same
+    contract ORDER BY relied on, now shared with MIN/MAX so every value
+    ordering in the engine agrees."""
+    a, b = _coerce_pair(a, b)
+    try:
+        return -1 if a < b else (1 if a > b else 0)
+    except TypeError:
+        a, b = str(a), str(b)
+        return -1 if a < b else (1 if a > b else 0)
 
 
 def _as_number(value):

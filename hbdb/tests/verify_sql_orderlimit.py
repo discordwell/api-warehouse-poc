@@ -139,15 +139,17 @@ def verify_python_backend():
 
 
 def verify_unsupported_fails_loud(engine):
-    """Aggregates / GROUP BY / HAVING / DISTINCT must raise, never silently
-    return raw rows."""
+    """A SELECT clause the engine cannot honor must raise, never silently
+    return raw rows.
+
+    Aggregates / GROUP BY / HAVING / DISTINCT are now implemented (see
+    tests/verify_sql_aggregates.py); window/analytic functions remain the
+    unsupported SELECT feature, so they are what must still fail loudly here.
+    """
     print("\nVerifying unsupported SELECT clauses fail loudly...")
     cases = {
-        "COUNT(*)": "SELECT COUNT(*) FROM ord",
-        "MAX(age)": "SELECT MAX(age) FROM ord",
-        "DISTINCT": "SELECT DISTINCT age FROM ord",
-        "GROUP BY": "SELECT age, COUNT(*) FROM ord GROUP BY age",
-        "HAVING": "SELECT age FROM ord GROUP BY age HAVING COUNT(*) > 1",
+        "window function": "SELECT ROW_NUMBER() OVER (ORDER BY age) FROM ord",
+        "unsupported aggregate": "SELECT STDDEV(age) FROM ord",
     }
     for label, sql in cases.items():
         try:

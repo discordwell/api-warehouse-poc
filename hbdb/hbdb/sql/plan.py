@@ -39,6 +39,30 @@ class LogicalLimit(LogicalNode):
     offset: int = 0
 
 @dataclass
+class LogicalAggregate(LogicalNode):
+    # GROUP BY + aggregate functions (and HAVING).
+    #   group_keys: list of sqlglot operand nodes to group by (the empty list
+    #     means a single global group -- e.g. SELECT COUNT(*) FROM t).
+    #   aggregates: list of aggregates.AggSpec to compute once per group.
+    #   output: ordered list of (source_expr, out_name) -- source_expr is the
+    #     SELECT item with its alias stripped (a group-key reference, an
+    #     aggregate, or an expression mixing the two); out_name is the result
+    #     column name (alias, column name, or the expression's SQL text).
+    #   having: a sqlglot predicate evaluated per group after aggregation
+    #     (None when there is no HAVING).
+    group_keys: List[Any]
+    aggregates: List[Any]
+    output: List[Any]
+    having: Any = None
+
+@dataclass
+class LogicalDistinct(LogicalNode):
+    # SELECT DISTINCT: collapse duplicate rows emitted by the child. No extra
+    # fields -- it de-duplicates whatever columns the child (a Project, or a
+    # bare scan for SELECT DISTINCT *) produces.
+    pass
+
+@dataclass
 class LogicalInsert(LogicalNode):
     table_name: str
     table_id: int

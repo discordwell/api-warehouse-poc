@@ -3,10 +3,11 @@ from typing import Iterator, Any, Dict, List, Tuple
 from abc import ABC, abstractmethod
 from .plan import (LogicalNode, LogicalScan, LogicalFilter, LogicalProject,
                    LogicalInsert, LogicalUpdate, LogicalDelete, LogicalJoin,
-                   LogicalSort, LogicalLimit)
+                   LogicalSort, LogicalLimit, LogicalAggregate, LogicalDistinct)
 from .encoding import KeyEncoder
 from .predicates import (evaluate as eval_predicate, resolve as resolve_operand,
-                         coerce_pair)
+                         compare_values, distinct_key)
+from .aggregates import compute as compute_agg, substitute_aggs
 from ..core.proxy import Transaction
 from ..core.cache import get_read_cache
 
@@ -351,19 +352,10 @@ class SortExecutor(PhysicalOperator):
                 if av is None:
                     return -1 if nulls_first else 1
                 return 1 if nulls_first else -1
-            c = self._cmp_values(av, bv)
+            c = compare_values(av, bv)
             if c:
                 return -c if desc else c
         return 0
-
-    @staticmethod
-    def _cmp_values(a: Any, b: Any) -> int:
-        a, b = coerce_pair(a, b)
-        try:
-            return -1 if a < b else (1 if a > b else 0)
-        except TypeError:
-            a, b = str(a), str(b)
-            return -1 if a < b else (1 if a > b else 0)
 
 
 class LimitExecutor(PhysicalOperator):
@@ -390,6 +382,79 @@ class LimitExecutor(PhysicalOperator):
             emitted += 1
 
 
+class AggregateExecutor(PhysicalOperator):
+    """GROUP BY + aggregate functions (with HAVING).
+
+    Materializes the child rows, buckets them by the resolved GROUP BY key
+    (first-appearance order, which is deterministic given the storage scan
+    order), then emits one output row per surviving group. With no GROUP BY it
+    forms a single global group -- emitted even for an empty input, so
+    ``SELECT COUNT(*) FROM empty`` returns one row holding 0.
+
+    Aggregate values are computed once per group, then spliced into the HAVING
+    and output expressions via ``substitute_aggs`` so the shared resolver does
+    the final arithmetic/comparison (``SUM(x) + 1``, ``HAVING COUNT(*) > 2``).
+    Non-aggregated output columns are GROUP BY keys, so they are read from a
+    representative row of the group (their value is constant within it).
+    """
+    def __init__(self, child: PhysicalOperator, node: LogicalAggregate):
+        self.child = child
+        self.node = node
+
+    def next(self) -> Iterator[Dict[str, Any]]:
+        rows = list(self.child.next())
+        node = self.node
+
+        groups: Dict[Any, List[Dict[str, Any]]] = {}
+        ordered_keys: List[Any] = []
+        if node.group_keys:
+            for row in rows:
+                key = tuple(resolve_operand(g, row) for g in node.group_keys)
+                bucket = groups.get(key)
+                if bucket is None:
+                    bucket = groups[key] = []
+                    ordered_keys.append(key)
+                bucket.append(row)
+        else:
+            groups[()] = rows
+            ordered_keys.append(())
+
+        for key in ordered_keys:
+            grp = groups[key]
+            rep = grp[0] if grp else {}
+            agg_values = {spec.key: compute_agg(spec, grp) for spec in node.aggregates}
+
+            if node.having is not None:
+                cond = substitute_aggs(node.having, agg_values)
+                if eval_predicate(cond, rep) is not True:
+                    continue
+
+            out = {}
+            for source_expr, name in node.output:
+                out[name] = resolve_operand(substitute_aggs(source_expr, agg_values), rep)
+            yield out
+
+
+class DistinctExecutor(PhysicalOperator):
+    """SELECT DISTINCT: yield each distinct row once, in first-seen order."""
+    def __init__(self, child: PhysicalOperator):
+        self.child = child
+
+    def next(self) -> Iterator[Dict[str, Any]]:
+        seen = set()
+        for row in self.child.next():
+            # Per-column (name, distinct_key) so de-duplication uses the same
+            # value equality as the rest of the engine (numeric coercion;
+            # TRUE stays distinct from 1); sorted by name for a stable,
+            # hashable key independent of dict ordering.
+            key = tuple(sorted(
+                (col, distinct_key(v)) for col, v in row.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            yield row
+
+
 def build_physical_plan(ctx: ExecutionContext, logical: LogicalNode, catalog=None) -> PhysicalOperator:
     if isinstance(logical, LogicalScan):
         # Check if index scan is possible
@@ -402,6 +467,10 @@ def build_physical_plan(ctx: ExecutionContext, logical: LogicalNode, catalog=Non
         return TableScanExecutor(ctx, logical)
     elif isinstance(logical, LogicalProject):
         return ProjectExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
+    elif isinstance(logical, LogicalAggregate):
+        return AggregateExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
+    elif isinstance(logical, LogicalDistinct):
+        return DistinctExecutor(build_physical_plan(ctx, logical.children[0], catalog))
     elif isinstance(logical, LogicalSort):
         return SortExecutor(build_physical_plan(ctx, logical.children[0], catalog), logical)
     elif isinstance(logical, LogicalLimit):

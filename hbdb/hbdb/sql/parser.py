@@ -5,7 +5,8 @@ from .catalog import Catalog
 from .plan import (LogicalNode, LogicalScan, LogicalFilter, LogicalProject,
                    LogicalInsert, LogicalUpdate, LogicalDelete, LogicalJoin,
                    LogicalCreateTable, LogicalCreateIndex, LogicalSort,
-                   LogicalLimit)
+                   LogicalLimit, LogicalAggregate, LogicalDistinct)
+from .aggregates import collect_aggregates, parse_agg
 from .types import Schema, Column
 
 class SQLParser:
@@ -128,9 +129,14 @@ class SQLParser:
 
         root = LogicalScan(children=[], schema=table.schema, table_name=table.name, table_id=table.id)
 
-        # Bind WHERE (Filter)
+        # Bind WHERE (Filter) -- WHERE filters input rows *before* grouping.
         if node.args.get("where"):
             root = LogicalFilter(children=[root], schema=root.schema, condition=node.args.get("where"))
+
+        # GROUP BY / aggregates produce their own output rows (one per group),
+        # so that path handles its own projection, ORDER BY and LIMIT.
+        if self._is_aggregate_query(node):
+            return self._bind_aggregate_query(node, root)
 
         # Decide projection. Only project plain column lists; SELECT *,
         # functions and aliased expressions stream through with all columns
@@ -142,9 +148,21 @@ class SQLParser:
             isinstance(p, (exp.Column, exp.Identifier)) for p in projections))
         select_cols = [p.name for p in projections] if bare_cols else None
 
+        order = node.args.get("order")
+
+        if node.args.get("distinct"):
+            # SELECT DISTINCT projects first, then de-duplicates; ORDER BY then
+            # sorts the distinct rows (so it may only reference output columns).
+            if select_cols is not None:
+                root = LogicalProject(children=[root], schema=root.schema, column_names=select_cols)
+            root = LogicalDistinct(children=[root], schema=root.schema)
+            if order:
+                keys = self._build_sort_keys(order, select_cols, table.schema)
+                root = LogicalSort(children=[root], schema=root.schema, keys=keys)
+            return self._maybe_limit(node, root)
+
         # Bind ORDER BY *below* the projection so it can sort on columns that
         # are not in the SELECT list (SELECT name FROM t ORDER BY age).
-        order = node.args.get("order")
         if order:
             keys = self._build_sort_keys(order, select_cols, table.schema)
             root = LogicalSort(children=[root], schema=root.schema, keys=keys)
@@ -160,23 +178,168 @@ class SQLParser:
 
     @staticmethod
     def _reject_unsupported(node: exp.Select):
-        """Fail loudly on SELECT features the engine does not implement.
+        """Fail loudly on SELECT features the engine still does not implement.
 
-        Without this, GROUP BY / HAVING / DISTINCT / aggregates were silently
-        dropped and the query returned raw rows -- e.g. ``SELECT COUNT(*)``
-        returned every row instead of a count. Raising keeps the engine
-        honest until these are actually supported.
+        GROUP BY / HAVING / aggregate functions and DISTINCT are now honored
+        (see ``_bind_aggregate_query`` and ``LogicalDistinct``); what remains
+        unimplemented is window/analytic functions. Raising keeps the engine
+        honest -- an unhandled clause must never be silently dropped and let a
+        query return the wrong rows.
         """
-        if node.args.get("distinct"):
-            raise NotImplementedError("SELECT DISTINCT is not supported")
-        if node.args.get("group"):
-            raise NotImplementedError("GROUP BY is not supported")
-        if node.args.get("having"):
-            raise NotImplementedError("HAVING is not supported")
         for proj in node.expressions:
-            if proj.find(exp.AggFunc):
+            if proj.find(exp.Window):
                 raise NotImplementedError(
-                    f"Aggregate functions are not supported: {proj.sql()}")
+                    f"Window functions are not supported: {proj.sql()}")
+
+    @staticmethod
+    def _is_aggregate_query(node: exp.Select) -> bool:
+        """True if this SELECT aggregates: it has GROUP BY/HAVING, or any
+        aggregate function in its projection list."""
+        if node.args.get("group") or node.args.get("having"):
+            return True
+        return any(p.find(exp.AggFunc) for p in node.expressions)
+
+    def _bind_aggregate_query(self, node: exp.Select, root: LogicalNode) -> LogicalNode:
+        """Build the Aggregate (+ Sort + Limit) plan for a GROUP BY / aggregate
+        SELECT. ``root`` is the input pipeline (Scan, optionally with a WHERE
+        Filter, or a Join tree)."""
+        group = node.args.get("group")
+        group_exprs = self._group_exprs(group, node) if group else []
+        group_col_names = {g.name for g in group_exprs if isinstance(g, exp.Column)}
+        group_sqls = {g.sql() for g in group_exprs}
+
+        having = node.args.get("having")
+        having_cond = having.this if having else None
+        # A bare column in HAVING must also be a GROUP BY key, exactly like a
+        # SELECT item -- otherwise its value is undefined across the group and
+        # we would silently filter on an arbitrary row.
+        if having_cond is not None:
+            self._validate_agg_projection(having_cond, group_col_names, group_sqls)
+
+        # Collect aggregates from the SELECT list *and* HAVING, so HAVING can
+        # reference an aggregate that is not in the SELECT list
+        # (GROUP BY k HAVING SUM(x) > 10 while selecting only k, COUNT(*)).
+        agg_sources = list(node.expressions)
+        if having_cond is not None:
+            agg_sources.append(having_cond)
+        specs = [parse_agg(a) for a in collect_aggregates(agg_sources)]
+
+        output = self._aggregate_output(node.expressions, group_col_names, group_sqls)
+
+        result = LogicalAggregate(
+            children=[root], schema=root.schema,
+            group_keys=group_exprs, aggregates=specs,
+            output=output, having=having_cond)
+
+        # ORDER BY / LIMIT apply to the aggregated output rows.
+        order = node.args.get("order")
+        if order:
+            keys = self._build_sort_keys_for_aggregate(order, output)
+            result = LogicalSort(children=[result], schema=root.schema, keys=keys)
+        return self._maybe_limit(node, result)
+
+    def _group_exprs(self, group: exp.Group, node: exp.Select):
+        """Resolve GROUP BY items to operand expressions, mapping positional
+        ``GROUP BY 1`` to the matching SELECT item."""
+        exprs = []
+        for g in group.expressions:
+            if isinstance(g, exp.Literal) and not g.is_string:
+                g = self._positional_select_expr(g, node)
+            exprs.append(g)
+        return exprs
+
+    @staticmethod
+    def _positional_select_expr(lit: exp.Literal, node: exp.Select):
+        pos = int(lit.this)
+        projs = node.expressions
+        if 1 <= pos <= len(projs):
+            p = projs[pos - 1]
+            return p.this if isinstance(p, exp.Alias) else p
+        raise ValueError(f"GROUP BY position {pos} is out of range")
+
+    def _aggregate_output(self, projections, group_col_names, group_sqls):
+        """Map each SELECT item to an ``(source_expr, out_name)`` pair and
+        validate it against the GROUP BY keys.
+
+        Every non-aggregated column must be a grouping key, otherwise its value
+        is undefined across the group -- we reject that rather than pick an
+        arbitrary row (fail-loud, like the WHERE evaluator)."""
+        output = []
+        for p in projections:
+            if isinstance(p, exp.Star):
+                raise NotImplementedError(
+                    "SELECT * with GROUP BY / aggregates is not supported; "
+                    "list the grouped columns explicitly")
+            expr, name = self._output_name(p)
+            self._validate_agg_projection(expr, group_col_names, group_sqls)
+            output.append((expr, name))
+        return output
+
+    @staticmethod
+    def _output_name(p):
+        """Output column name for a SELECT item: its alias, else the column
+        name for a bare column, else the expression's SQL text (e.g. the
+        unaliased ``COUNT(*)`` becomes the column ``"COUNT(*)"``)."""
+        if isinstance(p, exp.Alias):
+            return p.this, p.alias
+        if isinstance(p, exp.Column):
+            return p, p.name
+        return p, p.sql()
+
+    @staticmethod
+    def _validate_agg_projection(expr, group_col_names, group_sqls):
+        if expr.sql() in group_sqls:
+            return  # the whole projection is itself a grouping key
+        for col in expr.find_all(exp.Column):
+            if col.find_ancestor(exp.AggFunc) is not None:
+                continue  # inside an aggregate -- fine
+            if col.name in group_col_names or col.sql() in group_sqls:
+                continue  # references a GROUP BY key -- fine
+            raise ValueError(
+                f"Column '{col.sql()}' must appear in GROUP BY or be used in "
+                f"an aggregate function")
+
+    def _build_sort_keys_for_aggregate(self, order: exp.Order, output):
+        """ORDER BY for an aggregate query: keys are rewritten to reference the
+        aggregated output columns (by position, by matching SELECT expression,
+        or by output name). An ORDER BY aggregate that is not in the SELECT
+        list has nothing to sort against, so it fails loudly."""
+        name_by_sql = {}
+        for src, name in output:
+            name_by_sql.setdefault(src.sql(), name)
+        names = [name for _, name in output]
+        output_names = set(names)
+
+        keys = []
+        for ordered in order.expressions:
+            expr = ordered.this
+            desc = bool(ordered.args.get("desc"))
+            nulls_first = ordered.args.get("nulls_first")
+            if nulls_first is None:
+                nulls_first = not desc
+            if isinstance(expr, exp.Literal) and not expr.is_string:
+                pos = int(expr.this)
+                if not (1 <= pos <= len(names)):
+                    raise ValueError(f"ORDER BY position {pos} is out of range")
+                expr = exp.column(names[pos - 1])
+            elif expr.sql() in name_by_sql:
+                # Matches a SELECT expression (e.g. ORDER BY COUNT(*) or a group
+                # column) -> sort by its output column.
+                expr = exp.column(name_by_sql[expr.sql()])
+            elif isinstance(expr, exp.Column) and expr.name in output_names:
+                # Already an output column name (typically an alias) -- keep it;
+                # it resolves against the aggregated rows.
+                pass
+            else:
+                # Anything else (a bare aggregate not in SELECT, or a column
+                # that is neither grouped nor projected) has nothing to sort
+                # against once rows are aggregated. Fail loud rather than
+                # silently ignore the ORDER BY.
+                raise NotImplementedError(
+                    f"ORDER BY {expr.sql()} must reference a SELECT output "
+                    f"column (by name, position, or the same expression)")
+            keys.append((expr, desc, bool(nulls_first)))
+        return keys
 
     def _build_sort_keys(self, order: exp.Order, select_cols, schema):
         """Turn an sqlglot ORDER BY clause into (expr, desc, nulls_first) keys."""
@@ -278,6 +441,15 @@ class SQLParser:
         # Apply WHERE if present
         if node.args.get("where"):
             root = LogicalFilter(children=[root], schema=root.schema, condition=node.args.get("where"))
+
+        # GROUP BY / aggregates over the join output (one row per group).
+        if self._is_aggregate_query(node):
+            return self._bind_aggregate_query(node, root)
+
+        # SELECT DISTINCT de-duplicates the merged rows (the join path projects
+        # nothing, so this dedups across all joined columns).
+        if node.args.get("distinct"):
+            root = LogicalDistinct(children=[root], schema=root.schema)
 
         # ORDER BY / LIMIT / OFFSET. The join path projects nothing, so sort
         # keys resolve against the merged schema and positional refs index it.
