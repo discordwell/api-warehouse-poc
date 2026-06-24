@@ -2,6 +2,42 @@
 
 ## Session Summaries (most recent first; keep 20)
 
+### 2026-06-24T15:12Z — hbdb/sql: CASE expressions (+ IN-subquery data-loss fix)
+Continued the "fail loud, never silently wrong" trajectory on the FDB-style SQL
+engine with one silent-wrong fix and one feature, both centered on the shared
+operand resolver (`predicates.py`).
+- **IN-subquery silent-wrong fix (data loss).** `WHERE x IN (SELECT ...)` /
+  `x IN UNNEST(...)` parse with an *empty* `expressions` list (the operand sits
+  under `query`/`unnest`/`field`), so the old `_eval_in` loop never ran and
+  returned False for every row: `x IN (SELECT ...)` matched **nothing** and
+  `x NOT IN (SELECT ...)` matched **everything** — so
+  `DELETE FROM t WHERE id NOT IN (SELECT ...)` silently **wiped the whole
+  table** (confirmed: count=N, 0 rows left). Now `_eval_in` fails loud
+  (`NotImplementedError`) when there is no value list, matching how every other
+  subquery form already failed (scalar `= (SELECT ...)`, `EXISTS`, `= ANY`).
+  Guard is `if not node.expressions` — robust for any non-value-list IN; a
+  value list (incl. single-element `IN (5)`) always populates `expressions`.
+- **CASE expressions (added).** Searched (`CASE WHEN cond THEN r ... [ELSE d]
+  END`) and simple (`CASE x WHEN v THEN r END`) via a new `_fn_case` in
+  `_SCALAR_FUNCS` (keyed on `exp.Case`). Because it lives in the one shared
+  `_resolve`, CASE works in SELECT/WHERE/ORDER BY/GROUP BY/HAVING/`UPDATE SET`
+  at once, nests, and composes with aggregates (`SUM(CASE ...)`,
+  `COUNT(CASE WHEN ... THEN 1 END)`). SQL semantics: searched WHEN uses
+  three-valued `_eval` (UNKNOWN/NULL WHEN doesn't match → ELSE/NULL); simple
+  CASE compares with the engine's `=` so a NULL operand / `WHEN NULL` never
+  matches; no-ELSE and explicit `ELSE NULL` both yield NULL; only the selected
+  branch is evaluated (lazy), but an unsupported fn in the *taken* branch still
+  fails loud. A bare CASE used directly as a WHERE predicate is unsupported
+  (fails loud) — CASE is an operand, not a predicate node.
+- **Tests/docs.** New `tests/verify_sql_case.py` (~20 checks across all clauses,
+  NULL paths, laziness, fail-loud, pure-Python parity) wired into `run_all.py`;
+  IN-subquery regression added to `verify_sql_predicates.py` (low-level +
+  end-to-end "table not wiped" guard). README SQL Support updated (CASE listed;
+  IN documented as value-list-only with subqueries failing loud; subqueries
+  added to the "not implemented" list). Full suite **21/21** (incl. cluster).
+  Pure-Python change — no `.so` rebuild. A high-effort multi-agent code review
+  (2 finders, 24+ end-to-end edge-case probes) found no correctness issues.
+
 ### 2026-06-24T09:45Z — hbdb/sql: scalar functions (+ index-path silent-wrong fix)
 Added scalar functions to the FDB-style SQL engine, then a self-review caught
 and fixed two silent-wrong regressions the feature exposed in the optimizer.

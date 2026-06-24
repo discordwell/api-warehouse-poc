@@ -197,6 +197,8 @@ python examples/benchmark.py
 - Scalar functions in any expression position (SELECT, WHERE, ORDER BY,
   GROUP BY, HAVING, `UPDATE ... SET`): `COALESCE`, `NULLIF`, `UPPER`, `LOWER`,
   `LENGTH`, `TRIM`, `ABS`, `CEIL`, `FLOOR`, `ROUND`, `CONCAT` / `||`, and `CAST`
+- `CASE` expressions — searched (`CASE WHEN cond THEN r ... [ELSE d] END`) and
+  simple (`CASE x WHEN v THEN r ... END`) — in any expression position
 - `UPDATE` (with WHERE)
 - `DELETE` (with WHERE)
 
@@ -205,7 +207,9 @@ with index-scan execution; see `hbdb/sql/engine.py` and
 `tests/verify_sql_index.py`.)
 
 `WHERE` clauses in the FDB-style engine support `=`, `!=`/`<>`, `<`, `<=`,
-`>`, `>=`, `AND`, `OR`, `NOT`, parentheses, `IS [NOT] NULL`, `IN`,
+`>`, `>=`, `AND`, `OR`, `NOT`, parentheses, `IS [NOT] NULL`,
+`[NOT] IN (value, ...)` (a parenthesized value list — a subquery
+`IN (SELECT ...)` is unsupported and fails loud, never silently matching),
 `[NOT] BETWEEN`, and `[NOT] LIKE`/`ILIKE` (with `%`/`_` wildcards and an
 optional `ESCAPE` character), all with SQL three-valued (NULL) logic;
 predicate evaluation lives in `hbdb/sql/predicates.py` and is shared by the
@@ -234,6 +238,18 @@ zero (`ROUND(2.5) = 3`), not Python's round-half-to-even. Numeric functions
 `WHERE` and `SUM` use — but fail loud on a genuinely non-numeric argument
 rather than silently coercing it to 0/NULL. `CAST` to an integer truncates
 toward zero (`CAST(3.7 AS INTEGER) = 3`).
+
+`CASE` expressions resolve through that same shared operand resolver, so they
+work in every clause an operand is allowed (SELECT, WHERE, ORDER BY, GROUP BY,
+HAVING, `UPDATE ... SET`) — see `tests/verify_sql_case.py`. Both forms are
+supported: searched (`CASE WHEN cond THEN r ... [ELSE d] END`) and simple
+(`CASE x WHEN v THEN r ... END`). A searched `WHEN` is a full predicate under
+three-valued logic, so an UNKNOWN (NULL) condition does not match and a row
+matching no `WHEN` takes the `ELSE` (or NULL when there is none); a simple
+`CASE` compares the operand to each `WHEN` value with the engine's `=`, so a
+NULL operand — or a `WHEN NULL` — never matches. Only the selected branch is
+evaluated, but an unsupported function in the branch that *is* taken still
+fails loud.
 
 `INSERT`/`UPDATE` value literals are coerced through that same operand
 resolver, so floats, negative numbers, booleans and `NULL` keep their real
@@ -281,9 +297,10 @@ is **ambiguous and fails loud** (`ValueError`), as do two SELECT items that
 would land on the same output key (`SELECT a.id, b.id` — alias one), rather
 than silently picking a side.
 
-Clauses the engine still does not implement — window/analytic functions
-(`ROW_NUMBER() OVER (...)`), aggregates beyond the five above (`STDDEV`, ...),
-and scalar functions outside the set listed above (`SUBSTRING`, `REPLACE`, the
-`TRIM(... FROM ...)` forms, ...) — raise `NotImplementedError` rather than
-silently dropping the clause and returning the wrong rows (the same fail-loud
-contract the `WHERE` evaluator uses).
+Clauses the engine still does not implement — subqueries in any position
+(a scalar `(SELECT ...)`, `IN (SELECT ...)`, `EXISTS (...)`, `= ANY/ALL (...)`),
+window/analytic functions (`ROW_NUMBER() OVER (...)`), aggregates beyond the
+five above (`STDDEV`, ...), and scalar functions outside the set listed above
+(`SUBSTRING`, `REPLACE`, the `TRIM(... FROM ...)` forms, ...) — raise
+`NotImplementedError` rather than silently dropping the clause and returning the
+wrong rows (the same fail-loud contract the `WHERE` evaluator uses).

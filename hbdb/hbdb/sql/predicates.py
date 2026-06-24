@@ -21,12 +21,12 @@ UNKNOWN and propagates through AND/OR/NOT; the top-level WHERE treats anything
 that is not definitely True as not-matched.
 
 Scalar functions (COALESCE, NULLIF, UPPER, LOWER, LENGTH, TRIM, ABS, CEIL,
-FLOOR, ROUND, CONCAT / ``||``, CAST) are resolved here too -- see the dispatch
-table at the bottom of the file. Because every clause (WHERE, SELECT, ORDER BY,
-GROUP BY, HAVING, SET, aggregate arguments) routes operands through this single
-``_resolve``, a scalar function works in all of them at once. An unimplemented
-function still hits the fail-loud catch-all rather than being silently
-mis-evaluated.
+FLOOR, ROUND, CONCAT / ``||``, CAST) and the CASE expression (searched and
+simple) are resolved here too -- see the dispatch table at the bottom of the
+file. Because every clause (WHERE, SELECT, ORDER BY, GROUP BY, HAVING, SET,
+aggregate arguments) routes operands through this single ``_resolve``, a scalar
+function or CASE works in all of them at once. An unimplemented function still
+hits the fail-loud catch-all rather than being silently mis-evaluated.
 """
 import math
 import re
@@ -228,6 +228,20 @@ def _eval_is(node, row) -> bool:
 
 
 def _eval_in(node, row):
+    # Only a parenthesized value list (`x IN (1, 2, 3)`) is supported. A
+    # subquery or UNNEST (`x IN (SELECT ...)`, `x IN UNNEST(...)`) parses with
+    # an *empty* `expressions` list and the operand stashed under
+    # `query`/`unnest`/`field`. The old loop iterated that empty list and
+    # silently returned False for every row, so `x IN (SELECT ...)` matched
+    # nothing and -- the data-loss case -- `x NOT IN (SELECT ...)` matched
+    # *everything* (a DELETE/UPDATE with that predicate hit the whole table).
+    # Fail loud instead, exactly like the other unsupported subquery forms
+    # (a scalar `= (SELECT ...)`, EXISTS, `= ANY (...)`), so an unhandled
+    # construct can never be silently mis-evaluated.
+    if not node.expressions:
+        raise NotImplementedError(
+            f"IN requires a parenthesized value list; subqueries / UNNEST are "
+            f"not supported: {node.sql()}")
     left = _resolve(node.this, row)
     if left is None:
         return None
@@ -558,6 +572,41 @@ _CAST_FLOAT_TYPES = {_T.FLOAT, _T.DOUBLE, _T.DECIMAL}
 _CAST_TEXT_TYPES = {_T.TEXT, _T.VARCHAR, _T.CHAR, _T.NCHAR, _T.NVARCHAR}
 _CAST_BOOL_TYPES = {_T.BOOLEAN}
 
+
+def _fn_case(node, row):
+    """CASE expression -- searched or simple -- with three-valued logic and
+    lazy branch evaluation (only the chosen result is resolved).
+
+    Searched ``CASE WHEN cond THEN r [WHEN ...] [ELSE d] END``: each WHEN is a
+    full predicate run through the shared ``_eval``, so only a *definite* True
+    selects its result -- an UNKNOWN (NULL) condition does not match, per SQL.
+    Simple ``CASE x WHEN v THEN r ... END`` compares ``x`` to each ``v`` with
+    the engine's ``=`` (the same numeric-string coercion / NULL rules as
+    everywhere else); because ``x = NULL`` is UNKNOWN, ``CASE NULL WHEN NULL``
+    falls through rather than matching. The first matching THEN is returned;
+    with no match the ELSE is returned, or NULL when there is no ELSE. Results
+    route back through ``_resolve``, so a THEN/ELSE may itself be a column,
+    arithmetic, or another function -- and a branch that is not taken is never
+    evaluated (so an erroring expression in a non-selected branch is harmless).
+
+    Routing CASE through this one resolver is what makes it work identically in
+    SELECT, WHERE, ORDER BY, GROUP BY, HAVING and ``UPDATE ... SET`` at once.
+    """
+    operand = node.this  # the value matched by a simple CASE; None for searched
+    has_operand = operand is not None
+    op_val = _resolve(operand, row) if has_operand else None
+    for branch in node.args.get("ifs") or []:
+        if has_operand:
+            matched = _compare_op(
+                op_val, _resolve(branch.this, row), _COMPARATORS[exp.EQ]) is True
+        else:
+            matched = _eval(branch.this, row) is True
+        if matched:
+            return _resolve(branch.args.get("true"), row)
+    default = node.args.get("default")
+    return _resolve(default, row) if default is not None else None
+
+
 # sqlglot node type -> handler. Looked up in _resolve; an absent type falls
 # through to the fail-loud catch-all.
 _SCALAR_FUNCS = {
@@ -574,4 +623,5 @@ _SCALAR_FUNCS = {
     exp.Concat: _fn_concat,
     exp.DPipe: _fn_dpipe,
     exp.Cast: _fn_cast,
+    exp.Case: _fn_case,
 }

@@ -177,6 +177,50 @@ def verify_like_between_no_data_loss():
     _check("UPDATE WHERE age BETWEEN 25 AND 30 touched only Alice+Bob", hit, [1, 2])
 
 
+def verify_in_subquery_no_data_loss():
+    """`IN` / `NOT IN` with a *subquery* is unsupported and must fail loud, not
+    silently match the wrong rows.
+
+    A subquery `IN (SELECT ...)` parses with an empty value list, so the old
+    evaluator's loop never ran: `x IN (SELECT ...)` matched nothing, and -- the
+    data-loss case -- `x NOT IN (SELECT ...)` matched *everything*, which made
+    `DELETE ... WHERE id NOT IN (SELECT ...)` wipe the whole table. Confirm it
+    raises end-to-end (so the DELETE never runs and the table is intact), while
+    a plain value-list IN / NOT IN is unaffected."""
+    print("\nVerifying IN-subquery fails loud (no silent table wipe)...")
+    engine = SQLEngine(HBDB(force_python=True))
+    _populate(engine, "insub")
+
+    def ids():
+        return sorted(r["id"] for r in engine.execute("SELECT id FROM insub"))
+
+    for label, sql in [
+        ("SELECT ... IN (subquery)",
+         "SELECT id FROM insub WHERE id IN (SELECT id FROM insub)"),
+        ("SELECT ... NOT IN (subquery)",
+         "SELECT id FROM insub WHERE id NOT IN (SELECT id FROM insub)"),
+        ("DELETE ... NOT IN (subquery)",
+         "DELETE FROM insub WHERE id NOT IN (SELECT id FROM insub)"),
+    ]:
+        try:
+            engine.execute(sql)
+        except NotImplementedError:
+            print(f"{PASS}: {label} raises NotImplementedError")
+        else:
+            print(f"{FAIL}: {label} did not raise (silent-wrong / data-loss regression)")
+            sys.exit(1)
+
+    # The rejected DELETE must have committed nothing.
+    _check("table intact after rejected NOT-IN-subquery DELETE", ids(), [1, 2, 3, 4, 5])
+    # A plain value-list IN / NOT IN is untouched by the fix.
+    _check("value-list IN still works",
+           sorted(r["id"] for r in engine.execute("SELECT id FROM insub WHERE id IN (1, 3)")),
+           [1, 3])
+    _check("value-list NOT IN still works",
+           sorted(r["id"] for r in engine.execute("SELECT id FROM insub WHERE id NOT IN (1, 3)")),
+           [2, 4, 5])
+
+
 def verify_projection(engine):
     print("\nVerifying column projection...")
     one = engine.execute("SELECT name FROM cmp WHERE id = 1")[0]
@@ -224,10 +268,15 @@ def verify_unsupported_fails_loud():
     print("\nVerifying unsupported predicates fail loudly...")
     # LIKE / ILIKE / BETWEEN are now implemented (verify_like_between); SIMILAR
     # TO and the % / MOD operator are still unsupported and must raise rather
-    # than silently match.
+    # than silently match. IN with a *subquery* (as opposed to a value list) is
+    # likewise unsupported: it parses with an empty value list, so the old
+    # evaluator silently returned False for every row -- see
+    # verify_in_subquery_no_data_loss for the end-to-end data-loss angle.
     cases = {
         "SIMILAR TO (predicate)": "SELECT * FROM t WHERE name SIMILAR TO 'A%'",
         "% / MOD (operand)": "SELECT * FROM t WHERE x = 10 % 3",
+        "IN (subquery)": "SELECT * FROM t WHERE x IN (SELECT y FROM u)",
+        "NOT IN (subquery)": "SELECT * FROM t WHERE x NOT IN (SELECT y FROM u)",
     }
     for label, sql in cases.items():
         where = sqlglot.parse_one(sql).args["where"]
@@ -251,5 +300,6 @@ if __name__ == "__main__":
     verify_projection(shared)
     verify_no_data_loss()
     verify_like_between_no_data_loss()
+    verify_in_subquery_no_data_loss()
     verify_unsupported_fails_loud()
     print("\nAll predicate/projection checks passed.")
