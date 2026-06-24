@@ -14,11 +14,15 @@ matching everything, so an unhandled predicate fails loudly rather than
 silently deleting/updating/returning every row.
 
 Supported operators: =, !=/<>, <, <=, >, >=, AND, OR, NOT, parentheses,
-IS [NOT] NULL, IN, and + - * / arithmetic on operands. NULLs follow SQL's
-three-valued logic: a comparison touching NULL is UNKNOWN and propagates
-through AND/OR/NOT; the top-level WHERE treats anything that is not
-definitely True as not-matched.
+IS [NOT] NULL, IN, [NOT] BETWEEN, [NOT] LIKE / ILIKE (with ``%`` / ``_``
+wildcards and an optional ESCAPE character), and + - * / arithmetic on
+operands. NULLs follow SQL's three-valued logic: a comparison touching NULL is
+UNKNOWN and propagates through AND/OR/NOT; the top-level WHERE treats anything
+that is not definitely True as not-matched.
 """
+import re
+from functools import lru_cache
+
 from sqlglot import exp
 
 _COMPARATORS = {
@@ -75,6 +79,12 @@ def _eval(node, row):
         return _eval_is(node, row)
     if isinstance(node, exp.In):
         return _eval_in(node, row)
+    if isinstance(node, exp.Between):
+        return _eval_between(node, row)
+    if isinstance(node, (exp.Like, exp.ILike)):
+        return _eval_like(node, row, case_insensitive=isinstance(node, exp.ILike))
+    if isinstance(node, exp.Escape):
+        return _eval_escape(node, row)
     if type(node) in _COMPARATORS:
         return _eval_comparison(node, row)
     if isinstance(node, exp.Boolean):
@@ -85,21 +95,117 @@ def _eval(node, row):
 
 
 def _eval_comparison(node, row):
-    left = _resolve(node.left, row)
-    right = _resolve(node.right, row)
-    # SQL three-valued logic: a comparison touching NULL is UNKNOWN.
+    return _compare_op(_resolve(node.left, row), _resolve(node.right, row),
+                       _COMPARATORS[type(node)])
+
+
+def _compare_op(left, right, op):
+    """Three-valued comparison of two already-resolved values with ``op`` (a
+    two-argument predicate from ``_COMPARATORS``).
+
+    Shared by the comparison operators and BETWEEN so they agree on coercion
+    and NULL handling. A NULL operand is UNKNOWN; operands that are genuinely
+    incomparable for an ordering operator (e.g. a number vs a non-numeric
+    string) are also UNKNOWN rather than inventing a lexicographic answer --
+    both more defensible and safer for DELETE/UPDATE scope."""
     if left is None or right is None:
         return None
     a, b = _coerce_pair(left, right)
-    compare = _COMPARATORS[type(node)]
     try:
-        return compare(a, b)
+        return op(a, b)
     except TypeError:
-        # Operands are genuinely incomparable for an ordering operator
-        # (e.g. a number vs a non-numeric string). Treat as UNKNOWN rather
-        # than inventing a lexicographic answer -- which is both more
-        # defensible and safer for DELETE/UPDATE scope.
         return None
+
+
+def _eval_between(node, row):
+    """``x BETWEEN low AND high`` is ``x >= low AND x <= high`` under SQL's
+    three-valued logic, reusing the same comparison/coercion as ``>=`` / ``<=``
+    (so ``NOT BETWEEN`` -- parsed as ``NOT (BETWEEN)`` -- inverts correctly)."""
+    value = _resolve(node.this, row)
+    low = _compare_op(value, _resolve(node.args["low"], row), _COMPARATORS[exp.GTE])
+    high = _compare_op(value, _resolve(node.args["high"], row), _COMPARATORS[exp.LTE])
+    if low is False or high is False:
+        return False
+    if low is None or high is None:
+        return None
+    return True
+
+
+def _eval_like(node, row, case_insensitive=False, escape=None):
+    """``LIKE`` / ``ILIKE`` with SQL ``%`` (any run of chars) and ``_`` (any
+    single char) wildcards. A NULL value or pattern is UNKNOWN. Operands are
+    coerced to text, so ``code LIKE '1%'`` works whether ``code`` is TEXT or
+    INTEGER. ``escape`` (from an ESCAPE clause) turns the next pattern char into
+    a literal."""
+    value = _resolve(node.this, row)
+    pattern = _resolve(node.expression, row)
+    if value is None or pattern is None:
+        return None
+    flags = re.DOTALL | (re.IGNORECASE if case_insensitive else 0)
+    return _compile_like(str(pattern), escape, flags).fullmatch(str(value)) is not None
+
+
+@lru_cache(maxsize=512)
+def _compile_like(pattern, escape, flags):
+    """Compile a LIKE pattern to a regex once per ``(pattern, escape, flags)``.
+
+    The predicate tree is evaluated once per row, so caching the compiled
+    matcher keeps a table scan (or a DELETE/UPDATE) from rebuilding the same
+    regex for every row."""
+    return re.compile(_like_to_regex(pattern, escape), flags)
+
+
+def _eval_escape(node, row):
+    """``<expr> LIKE <pattern> ESCAPE <char>`` parses as ``Escape(Like, char)``;
+    unwrap it and evaluate the LIKE with that escape character."""
+    inner = node.this
+    if not isinstance(inner, (exp.Like, exp.ILike)):
+        raise NotImplementedError(
+            f"ESCAPE is only supported on LIKE/ILIKE: {node.sql()}")
+    esc = _resolve(node.expression, row)
+    escape = None if esc is None else str(esc)
+    if escape is not None and len(escape) != 1:
+        raise ValueError("ESCAPE must be a single character")
+    return _eval_like(inner, row,
+                      case_insensitive=isinstance(inner, exp.ILike), escape=escape)
+
+
+def _like_to_regex(pattern, escape):
+    """Translate a SQL LIKE pattern into a (fullmatch) regex. ``%`` matches any
+    run of characters, ``_`` any single one; every other character matches
+    literally, and ``escape`` makes the following character literal.
+
+    A maximal run of wildcards collapses into a *single* quantifier --
+    ``.{k,}`` when the run contains a ``%`` (k = the number of ``_`` in it),
+    or ``.{k}`` for a pure ``_`` run. That is what keeps matching linear: the
+    naive ``%``->``.*`` / ``_``->``.`` mapping yields adjacent quantifiers like
+    ``.*..*.`` for ``%_%_``, which backtrack catastrophically -- a pattern such
+    as ``'%_%_%_...x'`` would otherwise hang a scan on a single row."""
+    out = []
+    i, n = 0, len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if escape and ch == escape:
+            # The next character is taken literally (a trailing escape is
+            # itself literal).
+            i += 1
+            out.append(re.escape(pattern[i] if i < n else ch))
+            i += 1
+            continue
+        if ch in "%_":
+            underscores = 0
+            has_pct = False
+            while i < n and pattern[i] in "%_" and not (escape and pattern[i] == escape):
+                if pattern[i] == "_":
+                    underscores += 1
+                else:
+                    has_pct = True
+                i += 1
+            out.append(f".{{{underscores},}}" if has_pct else f".{{{underscores}}}")
+            continue
+        out.append(re.escape(ch))
+        i += 1
+    return "".join(out)
 
 
 def _eval_is(node, row) -> bool:

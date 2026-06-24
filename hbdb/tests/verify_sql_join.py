@@ -101,6 +101,27 @@ def verify_star_keeps_both_collisions(engine):
     _check("bare item preserved", first.get("item"), "book")
 
 
+def verify_qualified_star_join(engine):
+    print("\nVerifying qualified star (t.*) in joins...")
+    _users_orders(engine, "qs_u", "qs_o")
+    rows = engine.execute(
+        "SELECT qs_u.* FROM qs_u JOIN qs_o ON qs_u.id = qs_o.user_id ORDER BY qs_o.id")
+    # t.* expands to *only* that table's columns; the colliding `id` keeps its
+    # qualified key (consistent with SELECT *), the non-colliding `name` is bare.
+    _check("t.* expands to that table only", sorted(rows[0].keys()), ["name", "qs_u.id"])
+    _check("t.* values", [(r["qs_u.id"], r["name"]) for r in rows],
+           [(1, "Alice"), (1, "Alice"), (2, "Bob")])
+    # t.* composes with another table's column.
+    mixed = engine.execute(
+        "SELECT qs_u.*, qs_o.item FROM qs_u JOIN qs_o ON qs_u.id = qs_o.user_id "
+        "ORDER BY qs_o.id")
+    _check("t.* + other col", sorted(mixed[0].keys()), ["item", "name", "qs_u.id"])
+    # A star qualified by a table not in the FROM/JOIN fails loud.
+    _expect_raise(engine, "unknown table.* fails loud",
+                  "SELECT bogus.* FROM qs_u JOIN qs_o ON qs_u.id = qs_o.user_id",
+                  ValueError)
+
+
 def verify_aliases_and_projection(engine):
     print("\nVerifying table aliases + qualified/aliased projection...")
     _users_orders(engine, "al_u", "al_o")
@@ -347,6 +368,7 @@ if __name__ == "__main__":
     shared = SQLEngine(HBDB())
     verify_inner_basic(shared)
     verify_star_keeps_both_collisions(shared)
+    verify_qualified_star_join(shared)
     verify_aliases_and_projection(shared)
     verify_left_right_full(shared)
     verify_cross_and_comma(shared)

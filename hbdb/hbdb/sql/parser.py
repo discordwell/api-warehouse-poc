@@ -11,6 +11,16 @@ from .plan import (LogicalNode, LogicalScan, LogicalFilter, LogicalProject,
 from .aggregates import collect_aggregates, parse_agg
 from .types import Schema, Column
 
+
+def _is_star_column(node) -> bool:
+    """True for a *qualified* star like ``t.*`` -- sqlglot parses it as a Column
+    whose ``this`` is a Star (with ``.name == '*'``), not as a bare
+    ``exp.Star``. Treating it as an ordinary column projects a bogus ``'*'``
+    output key (``{'*': None}``); callers expand it to the table's columns
+    instead."""
+    return isinstance(node, exp.Column) and isinstance(node.this, exp.Star)
+
+
 class SQLParser:
     def __init__(self, catalog: Catalog):
         self.catalog = catalog
@@ -140,37 +150,61 @@ class SQLParser:
         if self._is_aggregate_query(node):
             return self._bind_aggregate_query(node, root)
 
-        # Decide projection. Only project plain column lists; SELECT *,
-        # functions and aliased expressions stream through with all columns
-        # (projecting them by `.name` would mangle the result). `select_cols`
-        # is the projected name list, or None for "all columns".
+        # Decide projection. Three shapes:
+        #   * SELECT *            -> stream every column (no projection node).
+        #   * plain column list   -> LogicalProject (a fast name restriction).
+        #   * aliases/expressions -> LogicalProjectExprs (expression projection,
+        #     the same path the JOIN code uses).
+        # The last case is the fix for a silently-wrong bug: an aliased or
+        # computed SELECT item (`name AS who`, `age * 2 AS d`) used to fall
+        # through with no projection at all, so the engine streamed *every*
+        # column and the result row had no `who`/`d` key -- exactly the
+        # "silently return the wrong rows" failure the rest of the engine
+        # forbids. `select_cols` is the bare-name list, `expr_specs` the
+        # (out_name, expr) list; at most one is set.
         projections = node.expressions
-        is_star = len(projections) == 1 and isinstance(projections[0], exp.Star)
+        # A lone `*` or `t.*` streams every column; for a single table both mean
+        # "all columns", so no projection node is needed.
+        is_star = len(projections) == 1 and (
+            isinstance(projections[0], exp.Star) or _is_star_column(projections[0]))
+        # A bare column list excludes qualified stars (`t.*` is a Column but must
+        # expand, not project a literal `'*'` key).
         bare_cols = (not is_star and bool(projections) and all(
-            isinstance(p, (exp.Column, exp.Identifier)) for p in projections))
+            isinstance(p, (exp.Column, exp.Identifier)) and not _is_star_column(p)
+            for p in projections))
         select_cols = [p.name for p in projections] if bare_cols else None
+        expr_specs = (self._projection_specs(projections, table.schema)
+                      if projections and not is_star and not bare_cols else None)
 
         order = node.args.get("order")
 
         if node.args.get("distinct"):
             # SELECT DISTINCT projects first, then de-duplicates; ORDER BY then
             # sorts the distinct rows (so it may only reference output columns).
-            if select_cols is not None:
+            if expr_specs is not None:
+                root = LogicalProjectExprs(children=[root], schema=root.schema, projections=expr_specs)
+            elif select_cols is not None:
                 root = LogicalProject(children=[root], schema=root.schema, column_names=select_cols)
             root = LogicalDistinct(children=[root], schema=root.schema)
             if order:
-                keys = self._build_sort_keys(order, select_cols, table.schema)
+                keys = (self._build_projected_sort_keys(order, expr_specs, projected=True)
+                        if expr_specs is not None
+                        else self._build_sort_keys(order, select_cols, table.schema))
                 root = LogicalSort(children=[root], schema=root.schema, keys=keys)
             return self._maybe_limit(node, root)
 
         # Bind ORDER BY *below* the projection so it can sort on columns that
         # are not in the SELECT list (SELECT name FROM t ORDER BY age).
         if order:
-            keys = self._build_sort_keys(order, select_cols, table.schema)
+            keys = (self._build_projected_sort_keys(order, expr_specs, projected=False)
+                    if expr_specs is not None
+                    else self._build_sort_keys(order, select_cols, table.schema))
             root = LogicalSort(children=[root], schema=root.schema, keys=keys)
 
         # Bind SELECT (Project).
-        if select_cols is not None:
+        if expr_specs is not None:
+            root = LogicalProjectExprs(children=[root], schema=root.schema, projections=expr_specs)
+        elif select_cols is not None:
             root = LogicalProject(children=[root], schema=root.schema, column_names=select_cols)
 
         # Bind LIMIT / OFFSET at the very top (applied after sort + project).
@@ -481,13 +515,13 @@ class SQLParser:
             root = LogicalProjectExprs(children=[root], schema=root.schema, projections=specs)
             root = LogicalDistinct(children=[root], schema=root.schema)
             if order:
-                keys = self._build_join_sort_keys(order, specs, projected=True)
+                keys = self._build_projected_sort_keys(order, specs, projected=True)
                 root = LogicalSort(children=[root], schema=root.schema, keys=keys)
             return self._maybe_limit(node, root)
 
         # ORDER BY sits below projection so it can sort on any joined column.
         if order:
-            keys = self._build_join_sort_keys(order, specs, projected=False)
+            keys = self._build_projected_sort_keys(order, specs, projected=False)
             root = LogicalSort(children=[root], schema=root.schema, keys=keys)
         root = LogicalProjectExprs(children=[root], schema=root.schema, projections=specs)
         return self._maybe_limit(node, root)
@@ -551,13 +585,20 @@ class SQLParser:
                     f"Column '{col.name}' is ambiguous across the joined "
                     f"tables; qualify it (e.g. table.{col.name})")
 
-    def _join_projection_specs(self, node: exp.Select, table_specs, ambiguous):
-        """Map the SELECT list to ordered ``(out_name, expr)`` projection specs.
+    @staticmethod
+    def _projection_specs(projections, schema):
+        """Map a single-table SELECT list to ordered ``(out_name, expr)`` specs
+        for expression projection.
 
-        ``SELECT *`` expands to every joined column (bare name, or ``table.col``
-        when the name collides). Output names must be unique -- two columns that
-        would land on the same key (``SELECT a.id, b.id``) fail loud, since a
-        result row is a dict and cannot hold both."""
+        Used when the list is neither a lone ``*`` nor a plain column list --
+        i.e. it has an alias or a computed expression (``name AS who``,
+        ``age * 2 AS d``). Each spec's value is resolved per row through the
+        shared operand resolver (``predicates.resolve``), the same machinery the
+        JOIN path uses, so genuinely unsupported operands (``UPPER(x)``) still
+        fail loud instead of silently streaming the raw row. ``SELECT *`` mixed
+        with other items (``SELECT *, age * 2``) expands the star to every
+        column. Output names must be unique -- two items landing on the same key
+        fail loud, since a result row is a dict and cannot hold both."""
         specs = []
         seen = set()
 
@@ -569,12 +610,54 @@ class SQLParser:
             seen.add(out_name)
             specs.append((out_name, expr))
 
+        for p in projections:
+            if isinstance(p, exp.Star) or _is_star_column(p):
+                # `*` and (for a single table) `t.*` both expand to all columns.
+                for col in schema.columns:
+                    add(col.name, exp.column(col.name))
+            elif isinstance(p, exp.Alias):
+                add(p.alias, p.this)
+            elif isinstance(p, (exp.Column, exp.Identifier)):
+                add(p.name, p)
+            else:
+                add(p.sql(), p)
+        return specs
+
+    def _join_projection_specs(self, node: exp.Select, table_specs, ambiguous):
+        """Map the SELECT list to ordered ``(out_name, expr)`` projection specs.
+
+        ``SELECT *`` expands to every joined column (bare name, or ``table.col``
+        when the name collides); ``SELECT t.*`` expands to just table ``t``'s
+        columns. Output names must be unique -- two columns that would land on
+        the same key (``SELECT a.id, b.id``) fail loud, since a result row is a
+        dict and cannot hold both."""
+        specs = []
+        seen = set()
+
+        def add(out_name, expr):
+            if out_name in seen:
+                raise ValueError(
+                    f"Duplicate output column '{out_name}'; alias one of them "
+                    f"(e.g. {out_name} AS {out_name}2)")
+            seen.add(out_name)
+            specs.append((out_name, expr))
+
+        def emit(qualify, cols):
+            for c in cols:
+                out_name = c if c not in ambiguous else f"{qualify}.{c}"
+                add(out_name, exp.column(c, table=qualify))
+
         for p in node.expressions:
             if isinstance(p, exp.Star):
                 for qualify, cols in table_specs:
-                    for c in cols:
-                        out_name = c if c not in ambiguous else f"{qualify}.{c}"
-                        add(out_name, exp.column(c, table=qualify))
+                    emit(qualify, cols)
+            elif _is_star_column(p):
+                # t.* -> only table t's columns (p.table is its name/alias).
+                matched = [(q, cols) for q, cols in table_specs if q == p.table]
+                if not matched:
+                    raise ValueError(f"Unknown table '{p.table}' in {p.sql()}")
+                for qualify, cols in matched:
+                    emit(qualify, cols)
             elif isinstance(p, exp.Alias):
                 add(p.alias, p.this)
             elif isinstance(p, exp.Column):
@@ -583,15 +666,16 @@ class SQLParser:
                 add(p.sql(), p)
         return specs
 
-    def _build_join_sort_keys(self, order: exp.Order, specs, projected: bool):
-        """ORDER BY keys for the join path.
+    def _build_projected_sort_keys(self, order: exp.Order, specs, projected: bool):
+        """ORDER BY keys for any expression-projection path (JOINs and the
+        single-table alias/expression case).
 
         Positional ``ORDER BY n`` -> the n-th SELECT item. When ``projected``
         (the DISTINCT case, where rows hold only output columns) keys reference
         the output column name; otherwise they reference the item's source
-        expression, resolved against the full merged row -- so a non-DISTINCT
-        ORDER BY may also sort on joined columns that are not in the SELECT
-        list."""
+        expression, resolved against the full (pre-projection) row -- so a
+        non-DISTINCT ORDER BY may also sort on columns that are not in the
+        SELECT list."""
         out_names = [name for name, _ in specs]
         out_name_set = set(out_names)
         src_by_name = {name: expr for name, expr in specs}

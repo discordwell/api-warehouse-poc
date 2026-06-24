@@ -168,6 +168,7 @@ python tests/verify_sql_insert.py
 python tests/verify_sql_orderlimit.py
 python tests/verify_sql_aggregates.py
 python tests/verify_sql_join.py
+python tests/verify_sql_project.py
 
 # Cluster integration (spawns local coordinator + storage subprocesses)
 python tests/verify_sharding.py
@@ -185,7 +186,8 @@ python examples/benchmark.py
 - `CREATE TABLE` (with PRIMARY KEY)
 - `DROP TABLE`
 - `INSERT INTO` (single- and multi-row `VALUES (..), (..), ..`)
-- `SELECT` (with WHERE, column projection, `ORDER BY`, `LIMIT`/`OFFSET`)
+- `SELECT` (with WHERE, column projection including aliases/expressions like
+  `age * 2 AS doubled`, `ORDER BY`, `LIMIT`/`OFFSET`)
 - `SELECT ... GROUP BY` with aggregate functions (`COUNT`, `SUM`, `AVG`,
   `MIN`, `MAX`, including `COUNT(DISTINCT col)`) and `HAVING`
 - `SELECT DISTINCT`
@@ -199,11 +201,20 @@ with index-scan execution; see `hbdb/sql/engine.py` and
 `tests/verify_sql_index.py`.)
 
 `WHERE` clauses in the FDB-style engine support `=`, `!=`/`<>`, `<`, `<=`,
-`>`, `>=`, `AND`, `OR`, `NOT`, parentheses, `IS [NOT] NULL` and `IN`, with
-SQL three-valued (NULL) logic; predicate evaluation lives in
-`hbdb/sql/predicates.py` and is shared by the filter/update/delete operators
-(`tests/verify_sql_predicates.py`). `SELECT col, ...` projects to the listed
-columns; `SELECT *` returns all.
+`>`, `>=`, `AND`, `OR`, `NOT`, parentheses, `IS [NOT] NULL`, `IN`,
+`[NOT] BETWEEN`, and `[NOT] LIKE`/`ILIKE` (with `%`/`_` wildcards and an
+optional `ESCAPE` character), all with SQL three-valued (NULL) logic;
+predicate evaluation lives in `hbdb/sql/predicates.py` and is shared by the
+filter/update/delete operators, `HAVING`, and join `ON`
+(`tests/verify_sql_predicates.py`).
+
+`SELECT col, ...` projects to the listed columns, `SELECT *` returns all, and
+`SELECT t.*` returns one table's columns; an aliased or computed item
+(`SELECT name AS who`, `SELECT price * qty AS total`) projects through the
+shared operand resolver to exactly that output column, on the single-table path
+as well as in joins (`tests/verify_sql_project.py`). An unsupported scalar
+function in the SELECT list (e.g. `UPPER(x)`) raises rather than silently
+streaming the raw row.
 
 `INSERT`/`UPDATE` value literals are coerced through that same operand
 resolver, so floats, negative numbers, booleans and `NULL` keep their real

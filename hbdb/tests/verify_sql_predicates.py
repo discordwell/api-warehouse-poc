@@ -6,8 +6,9 @@ Regression for a data-loss bug: the executors only understood ``col =
 literal`` and treated every other predicate as "matches all rows", so
 ``WHERE x > 5`` returned the whole table and -- far worse -- ``DELETE ...
 WHERE x > 5`` wiped it. This exercises comparison operators, AND/OR/NOT,
-IS [NOT] NULL, IN, projection, and confirms unsupported predicates now
-fail loudly instead of matching everything.
+IS [NOT] NULL, IN, [NOT] BETWEEN, [NOT] LIKE / ILIKE (with ESCAPE),
+projection, and confirms unsupported predicates now fail loudly instead of
+matching everything.
 
 Note: every HBDB in one process+CWD shares the WAL, so a second instance
 recovers the first one's catalog. Each scenario therefore uses a uniquely
@@ -15,6 +16,7 @@ named table (the same convention verify_sql_index.py relies on).
 """
 import os
 import sys
+import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import sqlglot
@@ -93,6 +95,88 @@ def verify_null_and_in(engine):
     _check("name > 5 (incomparable) matches nothing", names("name > 5"), [])
 
 
+def verify_like_between(engine):
+    print("\nVerifying LIKE / ILIKE / BETWEEN...")
+
+    def names(where):
+        return sorted(r["name"] for r in engine.execute(f"SELECT * FROM cmp WHERE {where}"))
+
+    # LIKE: % is any run of chars, _ is exactly one; matching is case-sensitive.
+    _check("LIKE 'A%'", names("name LIKE 'A%'"), ["Alice"])
+    _check("LIKE '%e'", names("name LIKE '%e'"), ["Alice", "Charlie", "Dave", "Eve"])
+    _check("LIKE '_o_'", names("name LIKE '_o_'"), ["Bob"])
+    _check("LIKE '%a%' is case-sensitive", names("name LIKE '%a%'"), ["Charlie", "Dave"])
+    # ILIKE is the case-insensitive form.
+    _check("ILIKE '%A%'", names("name ILIKE '%A%'"), ["Alice", "Charlie", "Dave"])
+    # NOT LIKE parses as NOT(LIKE) and inverts; NULL stays UNKNOWN (no NULL name here).
+    _check("NOT LIKE '%e'", names("name NOT LIKE '%e'"), ["Bob"])
+    # Operands are coerced to text, so LIKE works on a numeric column too.
+    _check("age LIKE '2%' (numeric coerced)", names("age LIKE '2%'"), ["Bob", "Dave"])
+    # A NULL pattern (or value) is UNKNOWN -> matches nothing.
+    _check("LIKE NULL matches nothing", names("name LIKE NULL"), [])
+
+    # BETWEEN is inclusive and reuses the >=/<= coercion + three-valued logic.
+    _check("age BETWEEN 25 AND 35", names("age BETWEEN 25 AND 35"),
+           ["Alice", "Bob", "Charlie"])
+    _check("age NOT BETWEEN 25 AND 35", names("age NOT BETWEEN 25 AND 35"), ["Dave"])
+    _check("age BETWEEN 20 AND 20 (degenerate)", names("age BETWEEN 20 AND 20"), ["Dave"])
+    _check("text BETWEEN 'A' AND 'C'", names("name BETWEEN 'A' AND 'C'"), ["Alice", "Bob"])
+    # Eve's age is NULL; a NULL bound makes the whole comparison UNKNOWN.
+    _check("BETWEEN with NULL bound matches nothing",
+           names("age BETWEEN 25 AND NULL"), [])
+
+    # ESCAPE: treat the next pattern char literally, so %/_ can be matched.
+    engine.execute("CREATE TABLE esc (id INTEGER PRIMARY KEY, s TEXT)")
+    for i, s in [(1, "10%"), (2, "100"), (3, "1_0"), (4, "1X0")]:
+        engine.execute(f"INSERT INTO esc VALUES ({i}, '{s}')")
+
+    def esc_ids(where):
+        return sorted(r["id"] for r in engine.execute(f"SELECT id FROM esc WHERE {where}"))
+
+    _check(r"LIKE '10\%' ESCAPE '\' (literal %)", esc_ids(r"s LIKE '10\%' ESCAPE '\'"), [1])
+    _check(r"LIKE '1\_0' ESCAPE '\' (literal _)", esc_ids(r"s LIKE '1\_0' ESCAPE '\'"), [3])
+    _check("LIKE '1_0' (wildcard _)", esc_ids("s LIKE '1_0'"), [2, 3, 4])
+
+
+def verify_like_no_redos():
+    """A LIKE pattern that alternates % and _ ('%_%_..x') used to translate to
+    '.*..*..x' and backtrack catastrophically -- a single non-matching row could
+    hang the whole scan. The translator now collapses each wildcard run into one
+    quantifier, so matching stays linear. Guard it with a wall-clock budget."""
+    print("\nVerifying LIKE has no catastrophic backtracking...")
+    where = sqlglot.parse_one(
+        "SELECT 1 WHERE x LIKE '" + "%_" * 16 + "z'").args["where"]
+    row = {"x": "a" * 256}  # long, and never matches (no 'z')
+    start = time.monotonic()
+    result = evaluate(where, row)
+    elapsed = time.monotonic() - start
+    if result is not False:
+        print(f"{FAIL}: pathological LIKE should not match, got {result!r}")
+        sys.exit(1)
+    if elapsed > 1.0:
+        print(f"{FAIL}: pathological LIKE took {elapsed:.2f}s (ReDoS regression)")
+        sys.exit(1)
+    print(f"{PASS}: pathological LIKE evaluated in {elapsed * 1000:.1f}ms")
+
+
+def verify_like_between_no_data_loss():
+    """LIKE / BETWEEN go through the same shared evaluator as WHERE, so DELETE
+    and UPDATE honor them too -- and must not over-match (the data-loss class)."""
+    print("\nVerifying UPDATE/DELETE honor LIKE/BETWEEN (no over-match)...")
+    engine = SQLEngine(HBDB(force_python=True))
+    _populate(engine, "lb")
+
+    def ids():
+        return sorted(r["id"] for r in engine.execute("SELECT id FROM lb"))
+
+    # DELETE only the names starting with a capital C..D via a range, plus a LIKE.
+    engine.execute("DELETE FROM lb WHERE name LIKE 'Char%'")  # Charlie (id 3)
+    _check("DELETE WHERE name LIKE 'Char%'", ids(), [1, 2, 4, 5])
+    engine.execute("UPDATE lb SET name = 'HIT' WHERE age BETWEEN 25 AND 30")  # Alice, Bob
+    hit = sorted(r["id"] for r in engine.execute("SELECT id FROM lb WHERE name = 'HIT'"))
+    _check("UPDATE WHERE age BETWEEN 25 AND 30 touched only Alice+Bob", hit, [1, 2])
+
+
 def verify_projection(engine):
     print("\nVerifying column projection...")
     one = engine.execute("SELECT name FROM cmp WHERE id = 1")[0]
@@ -138,8 +222,11 @@ def verify_unsupported_fails_loud():
     """An unhandled predicate must raise, never silently match every row
     (that fail-open behavior was the root of the data-loss bug)."""
     print("\nVerifying unsupported predicates fail loudly...")
+    # LIKE / ILIKE / BETWEEN are now implemented (verify_like_between); SIMILAR
+    # TO and the % / MOD operator are still unsupported and must raise rather
+    # than silently match.
     cases = {
-        "LIKE (predicate)": "SELECT * FROM t WHERE name LIKE 'A%'",
+        "SIMILAR TO (predicate)": "SELECT * FROM t WHERE name SIMILAR TO 'A%'",
         "% / MOD (operand)": "SELECT * FROM t WHERE x = 10 % 3",
     }
     for label, sql in cases.items():
@@ -159,7 +246,10 @@ if __name__ == "__main__":
     verify_comparisons(shared)
     verify_compound(shared)
     verify_null_and_in(shared)
+    verify_like_between(shared)
+    verify_like_no_redos()
     verify_projection(shared)
     verify_no_data_loss()
+    verify_like_between_no_data_loss()
     verify_unsupported_fails_loud()
     print("\nAll predicate/projection checks passed.")

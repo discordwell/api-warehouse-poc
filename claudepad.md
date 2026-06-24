@@ -2,6 +2,30 @@
 
 ## Session Summaries (most recent first; keep 20)
 
+### 2026-06-24T04:15Z — hbdb/sql: expression projection + LIKE/BETWEEN (+ review fixes)
+Two improvements to the FDB-style SQL engine, continuing the "fail loud, never
+silently wrong" trajectory, plus fixes from a self-review pass.
+- **Silent-wrong projection bug (fixed).** Single-table `SELECT name AS who` /
+  `SELECT age * 2 AS d` used to fall through with *no* projection, streaming
+  every column (result row had no `who`/`d` key) — the JOIN path projected
+  expressions correctly, the single-table path didn't. Now both route through
+  `LogicalProjectExprs` + the shared operand resolver via the new
+  `_projection_specs`; an unsupported scalar fn (`UPPER(x)`) raises instead of
+  streaming the raw row. `_build_join_sort_keys` → `_build_projected_sort_keys`
+  (now shared by both paths). New `tests/verify_sql_project.py`.
+- **LIKE/ILIKE/BETWEEN (added).** New branches in the shared `predicates._eval`,
+  so they work in WHERE *and* DELETE/UPDATE/HAVING/JOIN-ON for free.
+  `%`/`_` wildcards, optional `ESCAPE`, three-valued NULL logic, text coercion.
+  `verify_sql_predicates.py` extended (and its "LIKE fails loud" assertion
+  swapped for `SIMILAR TO`, which is still unsupported).
+- **Review fixes (this session):** (1) LIKE ReDoS — `%_%_…x` translated to
+  `.*..*..x` and backtracked catastrophically (a single row could hang a scan);
+  `_like_to_regex` now collapses each wildcard run into one quantifier
+  (`.{k,}`/`.{k}`) and `_compile_like` is `lru_cache`d. (2) `t.*` qualified star
+  used to project a bogus `{'*': None}`; now expands to the table's columns on
+  both the single-table and JOIN paths (unknown qualifier → fail loud).
+Full suite: 19/19 (incl. cluster). No C++ changes (pure Python).
+
 ### 2026-06-18T10:42Z — hbdb/sql: correct, tested JOIN support
 Implemented real `JOIN` in the FDB-style SQL engine (`hbdb/hbdb/sql/`),
 continuing the recent "fail loud, never silently wrong" trajectory. The
