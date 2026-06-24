@@ -2,6 +2,37 @@
 
 ## Session Summaries (most recent first; keep 20)
 
+### 2026-06-24T09:45Z — hbdb/sql: scalar functions (+ index-path silent-wrong fix)
+Added scalar functions to the FDB-style SQL engine, then a self-review caught
+and fixed two silent-wrong regressions the feature exposed in the optimizer.
+- **Scalar functions (added).** `COALESCE`, `NULLIF`, `UPPER`, `LOWER`,
+  `LENGTH`, `TRIM`, `ABS`, `CEIL`, `FLOOR`, `ROUND`, `CONCAT`/`||`, `CAST`.
+  All live in the one shared operand resolver (`predicates._resolve`) via a
+  `_SCALAR_FUNCS` dispatch table, so they work in WHERE, SELECT, ORDER BY,
+  GROUP BY, HAVING and `UPDATE ... SET` at once. Purely additive — these nodes
+  used to hit the fail-loud catch-all. SQL NULL rules honored (COALESCE/NULLIF;
+  every other fn NULL-in→NULL-out; `||`/CONCAT propagate NULL the ANSI way).
+  Numeric fns fail loud on a non-NULL non-numeric arg (don't silently coerce);
+  numeric *strings* still accepted (engine-wide coercion). `ROUND` rounds halves
+  away from zero (Decimal/`ROUND_HALF_UP`), not Python's banker's rounding.
+  `CAST`-to-int truncates toward zero. `SUBSTRING` and the `TRIM(... FROM ...)`
+  forms stay unimplemented (fail loud). New `tests/verify_sql_functions.py`
+  (~45 checks incl. pure-Python parity) wired into `run_all.py`;
+  `verify_sql_project.py`'s fail-loud case moved `UPPER`→`SUBSTRING`.
+- **Index-path silent-wrong fixes (this session, found in review).** The new
+  fns broke two latent assumptions in `optimizer._maybe_index_scan`:
+  (1) `WHERE CAST(col AS INT) = 19` index-scanned `col`'s *raw* stored value
+  (19.95) and dropped the row — `exp.Cast.name` is the inner column name, so the
+  `hasattr(left,'name')` check was fooled. (2) `WHERE col = COALESCE(other, 5)`
+  resolved to the fallback `5` on the optimizer's empty probe row and looked up
+  `col = 5` instead of the per-row predicate. Fix (right altitude, not a CAST
+  special-case): require the LHS to be a bare `exp.Column` and the RHS to have
+  *no* column reference (`cond.right.find(exp.Column) is None`); a truly
+  constant scalar RHS (`col = ABS(-5)`) still folds and uses the index. Also
+  broadened the resolve `except` to `ValueError` so a constant bad cast falls
+  back to a scan instead of aborting at optimize time. Regression cases added to
+  `verify_sql_functions.py`. Full suite: 20/20 (incl. cluster).
+
 ### 2026-06-24T04:15Z — hbdb/sql: expression projection + LIKE/BETWEEN (+ review fixes)
 Two improvements to the FDB-style SQL engine, continuing the "fail loud, never
 silently wrong" trajectory, plus fixes from a self-review pass.

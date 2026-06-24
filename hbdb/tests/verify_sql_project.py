@@ -11,8 +11,9 @@ already projected expressions correctly, the single-table path did not.
 
 This exercises aliases, arithmetic expressions, ``SELECT *`` mixed with
 expressions, and their composition with DISTINCT / ORDER BY / LIMIT, and
-confirms unsupported operands (``UPPER(x)``) and duplicate output names still
-fail loud rather than silently leaking the raw row.
+confirms unsupported operands (``SUBSTRING(x, ...)``) and duplicate output
+names still fail loud rather than silently leaking the raw row. (Scalar
+functions like ``UPPER`` are now implemented; see ``verify_sql_functions.py``.)
 
 Note: every HBDB in one process+CWD shares the WAL, so a second instance
 recovers the first one's catalog. Each scenario therefore uses a uniquely
@@ -162,9 +163,12 @@ def verify_order_by_with_projection(engine):
 def verify_fail_loud(engine):
     print("\nVerifying projection still fails loud where it must...")
     # An unsupported scalar function must raise, not silently stream the row.
+    # (Many scalar functions are now implemented -- see verify_sql_functions.py;
+    # SUBSTRING is deliberately still unsupported, so it exercises the
+    # fail-loud contract for an unimplemented function in the SELECT list.)
     _expect_raises(
         "unsupported function projection",
-        lambda: engine.execute("SELECT UPPER(name) AS u FROM proj"),
+        lambda: engine.execute("SELECT SUBSTRING(name, 1, 2) AS u FROM proj"),
         NotImplementedError)
     # Two SELECT items landing on the same output key cannot both fit in a row.
     _expect_raises(

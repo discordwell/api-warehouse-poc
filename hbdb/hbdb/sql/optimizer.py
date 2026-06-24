@@ -141,20 +141,38 @@ class Optimizer:
         cond = filter_node.condition
         if isinstance(cond, exp.Where):
             cond = cond.this
-        if isinstance(cond, exp.EQ) and hasattr(cond.left, 'name'):
+        # An index point lookup is only valid for `<column> = <constant>`.
+        # Two guards keep a scalar function from turning that into the wrong
+        # rows (the engine's cardinal sin):
+        #   * The left side must be a bare column, not a function wrapping one.
+        #     `CAST(col AS INT) = 19` would otherwise index-scan col's raw
+        #     stored value and miss 19.95 (which casts to 19) -- exp.Cast.name
+        #     returns the inner column name, so a plain hasattr('name') check
+        #     was fooled.
+        #   * The right side must be a genuine constant -- no column reference.
+        #     `col = COALESCE(other, 5)` is a per-row predicate; resolving it
+        #     against an empty row yields the fallback 5, which would index-scan
+        #     `col = 5` and drop every row where col = other != 5.
+        # A constant scalar expression on the right (`col = ABS(-5)`) still
+        # folds to a literal and uses the index, which is correct.
+        if isinstance(cond, exp.EQ) and isinstance(cond.left, exp.Column):
             col = cond.left.name
             for idx in indexes:
                 if idx.column_name == col:
+                    if cond.right.find(exp.Column) is not None:
+                        return  # correlated/per-row RHS -> scan + filter
                     # Resolve the lookup value through the shared operand
                     # resolver so it carries the same Python type INSERT stored
                     # in the index (e.g. -5, not the string "5" that
                     # cond.right.this yields for a negative literal -- which
                     # made indexed `= -5` silently miss while a full scan found
-                    # the row). Only use the index for a concrete scalar;
-                    # anything else falls back to a scan + filter, always correct.
+                    # the row). A constant that fails to resolve (NotImplemented
+                    # operand, or a bad cast like CAST('x' AS INT) -> ValueError)
+                    # falls back to a scan + filter, always correct -- never an
+                    # abort at optimize time.
                     try:
                         lookup = resolve(cond.right, {})
-                    except NotImplementedError:
+                    except (NotImplementedError, ValueError):
                         lookup = None
                     if lookup is not None:
                         scan.index_id = idx.id

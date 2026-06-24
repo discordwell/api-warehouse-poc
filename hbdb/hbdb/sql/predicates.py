@@ -19,8 +19,18 @@ wildcards and an optional ESCAPE character), and + - * / arithmetic on
 operands. NULLs follow SQL's three-valued logic: a comparison touching NULL is
 UNKNOWN and propagates through AND/OR/NOT; the top-level WHERE treats anything
 that is not definitely True as not-matched.
+
+Scalar functions (COALESCE, NULLIF, UPPER, LOWER, LENGTH, TRIM, ABS, CEIL,
+FLOOR, ROUND, CONCAT / ``||``, CAST) are resolved here too -- see the dispatch
+table at the bottom of the file. Because every clause (WHERE, SELECT, ORDER BY,
+GROUP BY, HAVING, SET, aggregate arguments) routes operands through this single
+``_resolve``, a scalar function works in all of them at once. An unimplemented
+function still hits the fail-loud catch-all rather than being silently
+mis-evaluated.
 """
+import math
 import re
+from decimal import Decimal, ROUND_HALF_UP
 from functools import lru_cache
 
 from sqlglot import exp
@@ -273,8 +283,15 @@ def _resolve(node, row):
         return row.get(node.name)
     if isinstance(node, exp.Identifier):
         return row.get(node.name)
-    # An unrecognized expression (function call, CAST, %, ||, ...): fail
-    # loudly rather than silently mis-resolving it to a column lookup,
+    # Scalar functions (COALESCE, UPPER, ABS, CAST, ...) dispatch through the
+    # table at the bottom of the file. Routing them through this shared
+    # resolver is what makes them behave identically in WHERE, SELECT,
+    # ORDER BY, GROUP BY, HAVING and SET without any per-clause special-casing.
+    handler = _SCALAR_FUNCS.get(type(node))
+    if handler is not None:
+        return handler(node, row)
+    # An unrecognized expression (an unimplemented function, SUBSTRING, %, ...):
+    # fail loudly rather than silently mis-resolving it to a column lookup,
     # mirroring _eval's contract for predicate nodes.
     if isinstance(node, exp.Expression):
         raise NotImplementedError(
@@ -355,3 +372,206 @@ def _as_number(value):
         except ValueError:
             return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Scalar functions
+#
+# Each handler takes the sqlglot node and the row and returns a plain Python
+# value, recursing through ``_resolve`` for its operands. They are wired into
+# ``_resolve`` via ``_SCALAR_FUNCS`` (defined at the very bottom, after every
+# handler exists).
+#
+# NULL semantics follow SQL: unless a function is specifically about NULL
+# (COALESCE / NULLIF), a NULL argument yields NULL. Numeric functions fail loud
+# on a non-NULL, non-numeric argument rather than silently coercing it away
+# (the same contract SUM / AVG use in aggregates.py). String concatenation
+# (``||`` / CONCAT) propagates NULL the ANSI way, so use COALESCE to treat NULL
+# as the empty string.
+# ---------------------------------------------------------------------------
+
+def _number_or_null(node, row, fname):
+    """Resolve an operand that must be numeric. A NULL stays NULL; a non-NULL,
+    non-numeric value fails loud instead of being silently dropped."""
+    v = _resolve(node, row)
+    if v is None:
+        return None
+    n = _as_number(v)
+    if n is None:
+        raise ValueError(f"{fname} requires a numeric argument; got {v!r}")
+    return n
+
+
+def _concat_str(v):
+    """The string form of a value for concatenation / text CAST. Booleans
+    render as SQL ``true`` / ``false``; everything else uses its plain str."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
+def _fn_coalesce(node, row):
+    """COALESCE(a, b, ...) -> the first non-NULL argument, else NULL."""
+    for arg in [node.this, *(node.expressions or [])]:
+        v = _resolve(arg, row)
+        if v is not None:
+            return v
+    return None
+
+
+def _fn_nullif(node, row):
+    """NULLIF(a, b) -> NULL when a equals b (engine value-equality), else a."""
+    a = _resolve(node.this, row)
+    if a is None:
+        return None
+    b = _resolve(node.args.get("expression"), row)
+    if b is None:
+        return a  # a = NULL is UNKNOWN -> not equal -> yield a
+    av, bv = _coerce_pair(a, b)
+    return None if av == bv else a
+
+
+def _fn_upper(node, row):
+    v = _resolve(node.this, row)
+    return None if v is None else str(v).upper()
+
+
+def _fn_lower(node, row):
+    v = _resolve(node.this, row)
+    return None if v is None else str(v).lower()
+
+
+def _fn_length(node, row):
+    v = _resolve(node.this, row)
+    return None if v is None else len(str(v))
+
+
+def _fn_trim(node, row):
+    """Plain TRIM(x): strip surrounding whitespace. The LEADING / TRAILING and
+    TRIM(c FROM x) forms (which set ``position`` / ``expression``) are not
+    implemented -- fail loud rather than silently ignore the trim spec."""
+    if node.args.get("position") or node.args.get("expression"):
+        raise NotImplementedError(
+            f"Only plain TRIM(x) is supported: {node.sql()}")
+    v = _resolve(node.this, row)
+    return None if v is None else str(v).strip()
+
+
+def _fn_abs(node, row):
+    n = _number_or_null(node.this, row, "ABS")
+    return None if n is None else abs(n)
+
+
+def _fn_ceil(node, row):
+    n = _number_or_null(node.this, row, "CEIL")
+    return None if n is None else math.ceil(n)
+
+
+def _fn_floor(node, row):
+    n = _number_or_null(node.this, row, "FLOOR")
+    return None if n is None else math.floor(n)
+
+
+def _fn_round(node, row):
+    """ROUND(x[, d]) rounding halves away from zero (ROUND(2.5) = 3), the SQL
+    standard. Python's built-in round() uses banker's rounding (round half to
+    even), so the work goes through Decimal to get the SQL answer
+    deterministically; str(n) keeps binary-float noise out of the result."""
+    n = _number_or_null(node.this, row, "ROUND")
+    if n is None:
+        return None
+    ndigits = 0
+    dec = node.args.get("decimals")
+    if dec is not None:
+        d = _number_or_null(dec, row, "ROUND")
+        if d is None:
+            return None
+        ndigits = int(d)
+    quantum = Decimal(1).scaleb(-ndigits)
+    result = Decimal(str(n)).quantize(quantum, rounding=ROUND_HALF_UP)
+    return int(result) if ndigits <= 0 else float(result)
+
+
+def _fn_concat(node, row):
+    """CONCAT(a, b, ...) with ANSI NULL propagation (any NULL -> NULL)."""
+    parts = []
+    for e in node.expressions or []:
+        v = _resolve(e, row)
+        if v is None:
+            return None
+        parts.append(_concat_str(v))
+    return "".join(parts)
+
+
+def _fn_dpipe(node, row):
+    """``a || b`` string concatenation; ANSI NULL propagation. Chained
+    ``a || b || c`` is nested DPipe, so the recursion handles it."""
+    a = _resolve(node.this, row)
+    b = _resolve(node.args.get("expression"), row)
+    if a is None or b is None:
+        return None
+    return _concat_str(a) + _concat_str(b)
+
+
+def _cast_bool(v):
+    if isinstance(v, bool):
+        return v
+    n = _as_number(v)
+    if n is not None:
+        return n != 0
+    s = str(v).strip().lower()
+    if s in ("true", "t", "yes", "y"):
+        return True
+    if s in ("false", "f", "no", "n"):
+        return False
+    raise ValueError(f"cannot CAST {v!r} to boolean")
+
+
+def _fn_cast(node, row):
+    """CAST(x AS <type>) for the basic types. CAST to an integer truncates
+    toward zero (CAST(3.7 AS INT) = 3); a value that is not numeric at all
+    fails loud rather than casting to a silent 0/NULL."""
+    v = _resolve(node.this, row)
+    if v is None:
+        return None
+    target = node.to.this
+    if target in _CAST_INT_TYPES:
+        n = _as_number(v)
+        if n is None:
+            raise ValueError(f"cannot CAST {v!r} to integer")
+        return int(n)
+    if target in _CAST_FLOAT_TYPES:
+        n = _as_number(v)
+        if n is None:
+            raise ValueError(f"cannot CAST {v!r} to a real number")
+        return float(n)
+    if target in _CAST_TEXT_TYPES:
+        return _concat_str(v)
+    if target in _CAST_BOOL_TYPES:
+        return _cast_bool(v)
+    raise NotImplementedError(f"Unsupported CAST target: {node.to.sql()}")
+
+
+_T = exp.DataType.Type
+_CAST_INT_TYPES = {_T.INT, _T.BIGINT, _T.SMALLINT, _T.TINYINT}
+_CAST_FLOAT_TYPES = {_T.FLOAT, _T.DOUBLE, _T.DECIMAL}
+_CAST_TEXT_TYPES = {_T.TEXT, _T.VARCHAR, _T.CHAR, _T.NCHAR, _T.NVARCHAR}
+_CAST_BOOL_TYPES = {_T.BOOLEAN}
+
+# sqlglot node type -> handler. Looked up in _resolve; an absent type falls
+# through to the fail-loud catch-all.
+_SCALAR_FUNCS = {
+    exp.Coalesce: _fn_coalesce,
+    exp.Nullif: _fn_nullif,
+    exp.Upper: _fn_upper,
+    exp.Lower: _fn_lower,
+    exp.Length: _fn_length,
+    exp.Trim: _fn_trim,
+    exp.Abs: _fn_abs,
+    exp.Ceil: _fn_ceil,
+    exp.Floor: _fn_floor,
+    exp.Round: _fn_round,
+    exp.Concat: _fn_concat,
+    exp.DPipe: _fn_dpipe,
+    exp.Cast: _fn_cast,
+}

@@ -169,6 +169,7 @@ python tests/verify_sql_orderlimit.py
 python tests/verify_sql_aggregates.py
 python tests/verify_sql_join.py
 python tests/verify_sql_project.py
+python tests/verify_sql_functions.py
 
 # Cluster integration (spawns local coordinator + storage subprocesses)
 python tests/verify_sharding.py
@@ -193,6 +194,9 @@ python examples/benchmark.py
 - `SELECT DISTINCT`
 - `JOIN` (`INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, `CROSS`, and comma joins),
   including multi-table and self-joins
+- Scalar functions in any expression position (SELECT, WHERE, ORDER BY,
+  GROUP BY, HAVING, `UPDATE ... SET`): `COALESCE`, `NULLIF`, `UPPER`, `LOWER`,
+  `LENGTH`, `TRIM`, `ABS`, `CEIL`, `FLOOR`, `ROUND`, `CONCAT` / `||`, and `CAST`
 - `UPDATE` (with WHERE)
 - `DELETE` (with WHERE)
 
@@ -212,9 +216,24 @@ filter/update/delete operators, `HAVING`, and join `ON`
 `SELECT t.*` returns one table's columns; an aliased or computed item
 (`SELECT name AS who`, `SELECT price * qty AS total`) projects through the
 shared operand resolver to exactly that output column, on the single-table path
-as well as in joins (`tests/verify_sql_project.py`). An unsupported scalar
-function in the SELECT list (e.g. `UPPER(x)`) raises rather than silently
-streaming the raw row.
+as well as in joins (`tests/verify_sql_project.py`). An *unimplemented* scalar
+function in the SELECT list (e.g. `SUBSTRING(x, ...)`) raises rather than
+silently streaming the raw row.
+
+Scalar functions — `COALESCE`, `NULLIF`, `UPPER`, `LOWER`, `LENGTH`, `TRIM`,
+`ABS`, `CEIL`, `FLOOR`, `ROUND`, `CONCAT` / `||` and `CAST` — are evaluated by
+the same shared operand resolver (`hbdb/sql/predicates.py`), so a function
+works identically in every clause that takes an operand: SELECT, WHERE,
+ORDER BY, GROUP BY, HAVING and `UPDATE ... SET` (`tests/verify_sql_functions.py`).
+SQL NULL rules are honored: `COALESCE` returns the first non-NULL argument,
+`NULLIF(a, b)` is NULL when `a = b`, every other function returns NULL for a
+NULL argument, and `||` / `CONCAT` propagate NULL (ANSI) — wrap an argument in
+`COALESCE` to treat NULL as the empty string. `ROUND` rounds halves away from
+zero (`ROUND(2.5) = 3`), not Python's round-half-to-even. Numeric functions
+(`ABS`, `ROUND`, a numeric `CAST`) accept numeric *strings* — the same coercion
+`WHERE` and `SUM` use — but fail loud on a genuinely non-numeric argument
+rather than silently coercing it to 0/NULL. `CAST` to an integer truncates
+toward zero (`CAST(3.7 AS INTEGER) = 3`).
 
 `INSERT`/`UPDATE` value literals are coerced through that same operand
 resolver, so floats, negative numbers, booleans and `NULL` keep their real
@@ -263,7 +282,8 @@ would land on the same output key (`SELECT a.id, b.id` — alias one), rather
 than silently picking a side.
 
 Clauses the engine still does not implement — window/analytic functions
-(`ROW_NUMBER() OVER (...)`) and aggregates beyond the five above (`STDDEV`, ...)
-— raise `NotImplementedError` rather than silently dropping the clause and
-returning the wrong rows (the same fail-loud contract the `WHERE` evaluator
-uses).
+(`ROW_NUMBER() OVER (...)`), aggregates beyond the five above (`STDDEV`, ...),
+and scalar functions outside the set listed above (`SUBSTRING`, `REPLACE`, the
+`TRIM(... FROM ...)` forms, ...) — raise `NotImplementedError` rather than
+silently dropping the clause and returning the wrong rows (the same fail-loud
+contract the `WHERE` evaluator uses).
