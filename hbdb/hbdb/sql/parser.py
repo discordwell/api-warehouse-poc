@@ -26,8 +26,22 @@ class SQLParser:
         self.catalog = catalog
 
     def parse(self, sql: str) -> LogicalNode:
-        parsed = sqlglot.parse_one(sql)
-        
+        return self.bind(sqlglot.parse_one(sql))
+
+    def bind(self, parsed: exp.Expression) -> LogicalNode:
+        """Bind an already-parsed statement AST to a logical plan.
+
+        Split out of ``parse`` so the engine can parse once, materialize
+        uncorrelated subqueries against the live transaction (see
+        ``subqueries.py``), and then bind the rewritten tree.
+        """
+        # WITH / CTEs are not implemented on any statement kind. They used
+        # to be silently dropped from the args -- an unused CTE "worked" and
+        # a used one failed with a misleading "Table not found".
+        if parsed.args.get("with") or parsed.args.get("with_"):
+            raise NotImplementedError(
+                "WITH / common table expressions are not supported")
+
         if isinstance(parsed, exp.Select):
             return self._bind_select(parsed)
         elif isinstance(parsed, exp.Insert):
@@ -41,6 +55,27 @@ class SQLParser:
         else:
             raise ValueError(f"Unsupported statement: {parsed.key}")
 
+    @staticmethod
+    def _require_table_sources(node: exp.Select):
+        """Fail loud when a FROM or JOIN source is not a plain table.
+
+        A derived table (``FROM (SELECT ...) sub``) used to bind *silently
+        wrong*: ``find(exp.Table)`` descended into the subquery and bound its
+        inner table, dropping the subquery's WHERE and projection entirely --
+        ``SELECT * FROM (SELECT a FROM u WHERE a > 5) sub`` returned every
+        row and every column of ``u``.
+        """
+        frm = node.args.get("from") or node.args.get("from_")
+        if frm is not None and not isinstance(frm.this, exp.Table):
+            raise NotImplementedError(
+                f"Derived tables / non-table FROM sources are not "
+                f"supported: {frm.sql()}")
+        for join in node.args.get("joins") or []:
+            if not isinstance(join.this, exp.Table):
+                raise NotImplementedError(
+                    f"Derived tables / non-table JOIN sources are not "
+                    f"supported: {join.sql()}")
+
     def _bind_create(self, node: exp.Create) -> LogicalNode:
         kind = node.args.get("kind")
         if kind == "TABLE":
@@ -51,15 +86,22 @@ class SQLParser:
             raise ValueError(f"Unsupported CREATE kind: {kind}")
 
     def _bind_create_table(self, node: exp.Create) -> LogicalNode:
-        table_exp = node.this
-        table_name = table_exp.this.name
-        
-        # Parse columns
-        # sqlglot structures create table columns in node.this.expressions? No, node.this is Schema usually
+        # CREATE TABLE ... AS SELECT parses with the target as a bare Table
+        # (no column-def Schema) and the SELECT under `expression`. It used
+        # to fall through and silently create an *empty, zero-column* table,
+        # ignoring the SELECT entirely.
+        if node.args.get("expression") is not None:
+            raise NotImplementedError(
+                "CREATE TABLE ... AS SELECT is not supported; create the "
+                "table with explicit columns, then INSERT INTO ... SELECT")
+
+        # For 'CREATE TABLE x (id INT, name TEXT)' node.this is a Schema
+        # wrapping the table and its column definitions.
         schema_node = node.this
-        if not isinstance(schema_node, exp.Schema):
-             # Try finding schema in expressions if not directly there
-             pass
+        if not isinstance(schema_node, exp.Schema) or not schema_node.expressions:
+            raise ValueError(
+                f"CREATE TABLE requires a column list: {node.sql()}")
+        table_name = schema_node.this.name
 
         cols = []
         from .types import Column, DataType
@@ -117,6 +159,11 @@ class SQLParser:
         return LogicalCreateIndex(children=[], schema=None, index_name=index_name, table_name=table_name, column_name=cols[0])
 
     def _bind_select(self, node: exp.Select) -> LogicalNode:
+        # Every FROM/JOIN source must be a plain table -- a derived table
+        # would otherwise bind to its *inner* table and silently drop the
+        # subquery's own clauses.
+        self._require_table_sources(node)
+
         # Check for JOINs
         joins = node.args.get("joins")
 
@@ -743,6 +790,15 @@ class SQLParser:
         # (INSERT ... VALUES (..), (..), ..); bind every one of them, not
         # just the first -- silently dropping the rest was data loss.
         values_clause = node.expression
+        if isinstance(values_clause, (exp.Select, exp.Subquery, exp.Union)):
+            # INSERT ... SELECT needs the source rows materialized, which
+            # takes a live transaction; the engine handles it before binding
+            # (SQLEngine._insert_from_select). Reaching here means a direct
+            # parse() call -- fail with the real reason, not a bogus
+            # "0 values for N columns".
+            raise NotImplementedError(
+                "INSERT INTO ... SELECT is executed by the engine and "
+                "cannot be bound standalone")
         if not values_clause or not values_clause.expressions:
             raise ValueError("INSERT without VALUES not supported")
 

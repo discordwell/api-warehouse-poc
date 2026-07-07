@@ -115,6 +115,31 @@ class LogicalJoin(LogicalNode):
     left_pad: Any = None
     right_pad: Any = None
 
+def output_columns(node: LogicalNode) -> Optional[List[str]]:
+    """The ordered output column names a bound SELECT plan's result rows
+    will carry, or None when the plan shape does not determine them.
+
+    Row-shape-preserving wrappers (Sort/Limit/Distinct/Filter) delegate to
+    their child; the projection-defining nodes each know their own output
+    order. Used where a result's column *order* matters even though rows are
+    dicts: mapping subquery rows to a single value column, and mapping
+    INSERT ... SELECT source rows onto the target columns positionally.
+    """
+    if isinstance(node, (LogicalSort, LogicalLimit, LogicalDistinct,
+                         LogicalFilter)):
+        return output_columns(node.children[0])
+    if isinstance(node, LogicalProject):
+        return list(node.column_names)
+    if isinstance(node, LogicalProjectExprs):
+        return [name for name, _ in node.projections]
+    if isinstance(node, LogicalAggregate):
+        return [name for _, name in node.output]
+    if isinstance(node, LogicalScan):
+        # SELECT * over a single table: rows carry every schema column.
+        return [c.name for c in node.schema.columns]
+    return None
+
+
 @dataclass
 class LogicalCreateTable(LogicalNode):
     table_name: str

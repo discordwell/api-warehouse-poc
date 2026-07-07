@@ -141,6 +141,72 @@ def verify_write_consistency():
         exit(1)
 
 
+def verify_backfill():
+    """CREATE INDEX on an already-populated table must backfill the index.
+
+    Regression: the index used to start empty regardless of existing rows,
+    so `INSERT x N -> CREATE INDEX -> SELECT WHERE col = x` silently
+    returned nothing -- every pre-existing row was invisible to the index
+    scan while a full scan would have found it.
+    """
+    print("\nVerifying CREATE INDEX backfills existing rows...")
+    db = HBDB()
+    engine = SQLEngine(db)
+
+    engine.execute("CREATE TABLE backfill_t (id INTEGER PRIMARY KEY, "
+                   "city TEXT, pop INTEGER)")
+    engine.execute("INSERT INTO backfill_t VALUES (1, 'ada', 30), "
+                   "(2, 'bly', 25), (3, 'cor', 30)")
+    engine.execute("INSERT INTO backfill_t (id, city) VALUES (4, 'dun')")  # pop NULL
+    # The index arrives *after* the rows.
+    engine.execute("CREATE INDEX idx_pop ON backfill_t (pop)")
+
+    got = sorted(r["id"] for r in engine.execute(
+        "SELECT id FROM backfill_t WHERE pop = 30"))
+    if got == [1, 3]:
+        print("✅ SUCCESS: index scan sees rows inserted before CREATE INDEX.")
+    else:
+        print(f"❌ FAILURE: expected ids [1, 3], got {got}")
+        exit(1)
+
+    table = engine.catalog.get_table("backfill_t")
+    idx = engine.catalog.get_indexes_for_table(table.id)[0]
+    keys = sorted(k for k, _ in db.transaction().scan(
+        f"/t/{table.id}/_i/", f"/t/{table.id}/_i/~"))
+    expected = {f"/t/{table.id}/_i/{idx.id}/30/1",
+                f"/t/{table.id}/_i/{idx.id}/25/2",
+                f"/t/{table.id}/_i/{idx.id}/30/3"}
+    if expected.issubset(keys) and not any(k.endswith("/4") for k in keys):
+        print("✅ SUCCESS: backfill wrote entries for non-NULL values only.")
+    else:
+        print(f"❌ FAILURE: backfilled index keys wrong: {keys}")
+        exit(1)
+
+    # Rows inserted after the index coexist with backfilled ones.
+    engine.execute("INSERT INTO backfill_t VALUES (5, 'eze', 30)")
+    got = sorted(r["id"] for r in engine.execute(
+        "SELECT id FROM backfill_t WHERE pop = 30"))
+    if got == [1, 3, 5]:
+        print("✅ SUCCESS: pre- and post-index rows both served by the index.")
+    else:
+        print(f"❌ FAILURE: expected ids [1, 3, 5], got {got}")
+        exit(1)
+
+    # And index maintenance keeps working on a backfilled entry.
+    engine.execute("UPDATE backfill_t SET pop = 31 WHERE id = 1")
+    got30 = sorted(r["id"] for r in engine.execute(
+        "SELECT id FROM backfill_t WHERE pop = 30"))
+    got31 = sorted(r["id"] for r in engine.execute(
+        "SELECT id FROM backfill_t WHERE pop = 31"))
+    if got30 == [3, 5] and got31 == [1]:
+        print("✅ SUCCESS: UPDATE re-points a backfilled index entry.")
+    else:
+        print(f"❌ FAILURE: after UPDATE got pop=30 -> {got30}, "
+              f"pop=31 -> {got31}")
+        exit(1)
+
+
 if __name__ == "__main__":
     verify_index()
     verify_write_consistency()
+    verify_backfill()

@@ -186,7 +186,8 @@ python examples/benchmark.py
 
 - `CREATE TABLE` (with PRIMARY KEY)
 - `DROP TABLE`
-- `INSERT INTO` (single- and multi-row `VALUES (..), (..), ..`)
+- `INSERT INTO` (single- and multi-row `VALUES (..), (..), ..`, and
+  `INSERT INTO ... SELECT`)
 - `SELECT` (with WHERE, column projection including aliases/expressions like
   `age * 2 AS doubled`, `ORDER BY`, `LIMIT`/`OFFSET`)
 - `SELECT ... GROUP BY` with aggregate functions (`COUNT`, `SUM`, `AVG`,
@@ -199,22 +200,50 @@ python examples/benchmark.py
   `LENGTH`, `TRIM`, `ABS`, `CEIL`, `FLOOR`, `ROUND`, `CONCAT` / `||`, and `CAST`
 - `CASE` expressions — searched (`CASE WHEN cond THEN r ... [ELSE d] END`) and
   simple (`CASE x WHEN v THEN r ... END`) — in any expression position
+- Uncorrelated subqueries in any expression/predicate position: scalar
+  `(SELECT ...)`, `[NOT] IN (SELECT ...)`, `[NOT] EXISTS (...)`, and
+  quantified comparisons (`= ANY (...)`, `<> ALL (...)`, ...)
 - `UPDATE` (with WHERE)
 - `DELETE` (with WHERE)
 
 (The FDB-style engine's SQL layer additionally supports `CREATE INDEX`
-with index-scan execution; see `hbdb/sql/engine.py` and
-`tests/verify_sql_index.py`.)
+with index-scan execution — including a backfill of the table's existing
+rows, so an index created after data was loaded serves them too; see
+`hbdb/sql/engine.py` and `tests/verify_sql_index.py`.)
 
 `WHERE` clauses in the FDB-style engine support `=`, `!=`/`<>`, `<`, `<=`,
 `>`, `>=`, `AND`, `OR`, `NOT`, parentheses, `IS [NOT] NULL`,
-`[NOT] IN (value, ...)` (a parenthesized value list — a subquery
-`IN (SELECT ...)` is unsupported and fails loud, never silently matching),
-`[NOT] BETWEEN`, and `[NOT] LIKE`/`ILIKE` (with `%`/`_` wildcards and an
-optional `ESCAPE` character), all with SQL three-valued (NULL) logic;
+`[NOT] IN (value, ...)` (a parenthesized value list or an uncorrelated
+subquery), `[NOT] BETWEEN`, and `[NOT] LIKE`/`ILIKE` (with `%`/`_` wildcards
+and an optional `ESCAPE` character), all with SQL three-valued (NULL) logic;
 predicate evaluation lives in `hbdb/sql/predicates.py` and is shared by the
 filter/update/delete operators, `HAVING`, and join `ON`
 (`tests/verify_sql_predicates.py`).
+
+Uncorrelated subqueries are implemented by materialization
+(`hbdb/sql/subqueries.py`): before a statement is bound, the engine runs each
+subquery once — inside the statement's own transaction — and splices the
+result back into the expression tree as literals, so a subquery works in
+every clause an operand or predicate works in (SELECT list, WHERE, HAVING,
+ORDER BY, GROUP BY, `UPDATE ... SET`, `INSERT ... VALUES`, join `ON`) and
+subqueries nest arbitrarily (`tests/verify_sql_subqueries.py`). SQL semantics
+are honored: a scalar subquery yields NULL on an empty result and fails loud
+on more than one row/column; `x IN (empty result)` is FALSE — and `NOT IN`
+TRUE — even for a NULL `x`, while a NULL *in* the result makes an unmatched
+`NOT IN` UNKNOWN (matches nothing); `EXISTS` is TRUE on any row and its probe
+is capped with `LIMIT 1` (unless the subquery carries its own LIMIT);
+`ANY`/`SOME`/`ALL` fold with OR/AND under three-valued logic (over an empty
+set: ANY → FALSE, ALL → TRUE). A *correlated* subquery — one referencing the
+enclosing query's tables (or any column not in the subquery's own tables) —
+fails loud with `NotImplementedError` before executing: run standalone it
+would resolve the outer column to NULL and silently return wrong rows.
+
+`INSERT INTO t [(cols)] SELECT ...` materializes the source rows (in the
+same transaction) and maps the SELECT's output columns onto the target
+columns *positionally*, per SQL; a column-count mismatch fails loud. The
+source may be any supported SELECT (joins, aggregates, ORDER BY/LIMIT,
+subqueries), and `INSERT INTO t SELECT ... FROM t` reads its snapshot before
+writing, so a self-insert cannot chase its own rows.
 
 `SELECT col, ...` projects to the listed columns, `SELECT *` returns all, and
 `SELECT t.*` returns one table's columns; an aliased or computed item
@@ -297,10 +326,15 @@ is **ambiguous and fails loud** (`ValueError`), as do two SELECT items that
 would land on the same output key (`SELECT a.id, b.id` — alias one), rather
 than silently picking a side.
 
-Clauses the engine still does not implement — subqueries in any position
-(a scalar `(SELECT ...)`, `IN (SELECT ...)`, `EXISTS (...)`, `= ANY/ALL (...)`),
+Clauses the engine still does not implement — *correlated* subqueries,
+derived tables (`FROM (SELECT ...) t`), `WITH`/CTEs,
+`CREATE TABLE ... AS SELECT`, set operations (`UNION`/`INTERSECT`/`EXCEPT`),
 window/analytic functions (`ROW_NUMBER() OVER (...)`), aggregates beyond the
 five above (`STDDEV`, ...), and scalar functions outside the set listed above
 (`SUBSTRING`, `REPLACE`, the `TRIM(... FROM ...)` forms, ...) — raise
 `NotImplementedError` rather than silently dropping the clause and returning the
-wrong rows (the same fail-loud contract the `WHERE` evaluator uses).
+wrong rows (the same fail-loud contract the `WHERE` evaluator uses). Three of
+those used to be *silently wrong* and are now rejected: a derived table bound
+to its inner table (dropping the subquery's WHERE/projection), CTAS created an
+empty zero-column table, and an unused CTE was silently discarded
+(`tests/verify_sql_subqueries.py` pins all three).

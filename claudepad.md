@@ -2,6 +2,56 @@
 
 ## Session Summaries (most recent first; keep 20)
 
+### 2026-07-02T03:55Z — hbdb/sql: uncorrelated subqueries, INSERT…SELECT (+ 3 silent-wrong fixes)
+The big missing SQL feature landed: **uncorrelated subqueries in every
+expression/predicate position**, plus `INSERT INTO … SELECT`, plus fixes for
+three constructs that were *silently wrong* (worse than the fail-loud gaps).
+- **Subqueries by materialization** (new `hbdb/sql/subqueries.py`). The engine
+  now parses once, and before binding runs each uncorrelated subquery inside
+  the statement's own txn, splicing results back as literal nodes: scalar
+  `(SELECT …)` → literal/NULL (>1 row/col fails loud), `IN (SELECT …)` →
+  deduped value list (empty → meta-tagged In; `_eval_in` resolves the LHS then
+  returns FALSE — SQL's empty-set rule, even for NULL x), `EXISTS` →
+  TRUE/FALSE (probe capped `LIMIT 1` only when no explicit LIMIT — `LIMIT 0`
+  stays FALSE), `op ANY/SOME/ALL` → comparison vs a materialized `Tuple`
+  evaluated three-valued in `predicates._eval_quantified` (empty: ANY→FALSE,
+  ALL→TRUE). Nesting works via recursion (`engine._run_select` re-enters the
+  rewriter). NULL semantics all pinned by tests (`NOT IN` w/ NULL matches
+  nothing, etc.).
+- **Correlation = fail loud, and it MUST be.** The engine resolves unknown
+  columns to NULL at runtime, so a correlated subquery executed standalone
+  would silently return wrong rows. `subqueries._check_uncorrelated` rejects
+  any column not in the subquery's own FROM tables/aliases (typos included)
+  before execution. Scoping via `col.find_ancestor(exp.Select) is select`;
+  nested levels are checked when their level materializes.
+- **INSERT INTO … SELECT** (`engine._insert_from_select`): source rows fully
+  materialized first (self-insert reads its snapshot), mapped positionally via
+  new `plan.output_columns(plan)` (dict rows don't carry order); arity
+  mismatch fails loud; goes through InsertExecutor so indexes/cache upkeep are
+  identical to VALUES.
+- **Silent-wrong fixes:** (1) derived tables `FROM (SELECT …) s` used to bind
+  the *inner* table and drop the subquery's WHERE/projection — now
+  `parser._require_table_sources` fails loud; (2) `CREATE TABLE … AS SELECT`
+  silently created an empty zero-column table — fails loud; (3) `WITH`/CTEs
+  were silently dropped — fails loud (checked in engine before rewrite AND in
+  `parser.bind`). (4) Bonus, found by the new suite: **`CREATE INDEX` on a
+  populated table never backfilled** — index scans silently missed every
+  pre-existing row; `engine.create_index` now backfills (regression scenario
+  in `verify_sql_index.py`).
+- **Plumbing:** `parser.parse(sql)` → `parse_one` + `parser.bind(ast)` (engine
+  rewrites between); sqlglot 28.6 arg keys are `from_`/`with_` (code checks
+  both spellings). `In.meta["materialized_empty_set"]` lives in `_meta` (not
+  args) — survives `.copy()`/`transform(copy=True)` (verified), invisible to
+  `.sql()`.
+- **Tests/docs:** new `tests/verify_sql_subqueries.py` (~60 checks incl.
+  pure-Python parity) wired into `run_all.py`;
+  `verify_sql_predicates.py`'s IN-subquery block rewritten from "must raise"
+  to "must hit exact rows" (correlated DELETE still must raise + table
+  intact); direct `predicates.evaluate` of an *unmaterialized* subquery still
+  fails loud (the old wipe can't return through paths that skip the rewrite).
+  README SQL Support rewritten. Full suite **22/22** (incl. cluster). Pure
+  Python — no `.so` rebuild.
+
 ### 2026-06-24T15:12Z — hbdb/sql: CASE expressions (+ IN-subquery data-loss fix)
 Continued the "fail loud, never silently wrong" trajectory on the FDB-style SQL
 engine with one silent-wrong fix and one feature, both centered on the shared

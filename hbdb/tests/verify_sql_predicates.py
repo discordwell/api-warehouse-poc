@@ -178,47 +178,63 @@ def verify_like_between_no_data_loss():
 
 
 def verify_in_subquery_no_data_loss():
-    """`IN` / `NOT IN` with a *subquery* is unsupported and must fail loud, not
-    silently match the wrong rows.
+    """`IN` / `NOT IN` with an uncorrelated subquery must hit exactly the
+    right rows -- the historic data-loss shape, now implemented.
 
-    A subquery `IN (SELECT ...)` parses with an empty value list, so the old
-    evaluator's loop never ran: `x IN (SELECT ...)` matched nothing, and -- the
-    data-loss case -- `x NOT IN (SELECT ...)` matched *everything*, which made
-    `DELETE ... WHERE id NOT IN (SELECT ...)` wipe the whole table. Confirm it
-    raises end-to-end (so the DELETE never runs and the table is intact), while
-    a plain value-list IN / NOT IN is unaffected."""
-    print("\nVerifying IN-subquery fails loud (no silent table wipe)...")
+    A subquery `IN (SELECT ...)` parses with an empty value list, and the
+    original evaluator's loop never ran: `x IN (SELECT ...)` matched nothing
+    while `x NOT IN (SELECT ...)` matched *everything*, so `DELETE ... WHERE
+    id NOT IN (SELECT ...)` wiped the whole table. That was first fixed by
+    failing loud; the engine now materializes uncorrelated subqueries
+    (hbdb/sql/subqueries.py -- see verify_sql_subqueries.py for the full
+    matrix), so the same statements must return / delete exactly the right
+    rows. A *correlated* subquery still fails loud, and a plain value-list
+    IN / NOT IN is unaffected."""
+    print("\nVerifying IN-subquery hits exact rows (no silent table wipe)...")
     engine = SQLEngine(HBDB(force_python=True))
     _populate(engine, "insub")
 
     def ids():
         return sorted(r["id"] for r in engine.execute("SELECT id FROM insub"))
 
-    for label, sql in [
-        ("SELECT ... IN (subquery)",
-         "SELECT id FROM insub WHERE id IN (SELECT id FROM insub)"),
-        ("SELECT ... NOT IN (subquery)",
-         "SELECT id FROM insub WHERE id NOT IN (SELECT id FROM insub)"),
-        ("DELETE ... NOT IN (subquery)",
-         "DELETE FROM insub WHERE id NOT IN (SELECT id FROM insub)"),
-    ]:
-        try:
-            engine.execute(sql)
-        except NotImplementedError:
-            print(f"{PASS}: {label} raises NotImplementedError")
-        else:
-            print(f"{FAIL}: {label} did not raise (silent-wrong / data-loss regression)")
-            sys.exit(1)
+    _check("SELECT ... IN (subquery) matches the subquery's rows",
+           sorted(r["id"] for r in engine.execute(
+               "SELECT id FROM insub WHERE id IN "
+               "(SELECT id FROM insub WHERE age >= 25)")),
+           [1, 2, 3])
+    _check("SELECT ... NOT IN (subquery) matches only the complement",
+           sorted(r["id"] for r in engine.execute(
+               "SELECT id FROM insub WHERE id NOT IN "
+               "(SELECT id FROM insub WHERE age >= 25)")),
+           [4, 5])
+    # A correlated subquery cannot be materialized: executed standalone the
+    # outer column would silently resolve to NULL, so it must still raise --
+    # and the DELETE below proves a raising statement commits nothing.
+    try:
+        engine.execute("DELETE FROM insub WHERE id NOT IN "
+                       "(SELECT id FROM cmp WHERE cmp.age = insub.age)")
+    except NotImplementedError:
+        print(f"{PASS}: DELETE ... NOT IN (correlated subquery) raises "
+              f"NotImplementedError")
+    else:
+        print(f"{FAIL}: correlated NOT-IN DELETE did not raise "
+              f"(silent-wrong / data-loss regression)")
+        sys.exit(1)
+    _check("table intact after rejected correlated DELETE", ids(), [1, 2, 3, 4, 5])
 
-    # The rejected DELETE must have committed nothing.
-    _check("table intact after rejected NOT-IN-subquery DELETE", ids(), [1, 2, 3, 4, 5])
-    # A plain value-list IN / NOT IN is untouched by the fix.
+    # The historic wipe shape, live: delete the complement of a subset.
+    engine.execute("DELETE FROM insub WHERE id NOT IN "
+                   "(SELECT id FROM insub WHERE age >= 25)")
+    _check("DELETE ... NOT IN (subquery) removed exactly the complement",
+           ids(), [1, 2, 3])
+
+    # A plain value-list IN / NOT IN is untouched.
     _check("value-list IN still works",
            sorted(r["id"] for r in engine.execute("SELECT id FROM insub WHERE id IN (1, 3)")),
            [1, 3])
     _check("value-list NOT IN still works",
            sorted(r["id"] for r in engine.execute("SELECT id FROM insub WHERE id NOT IN (1, 3)")),
-           [2, 4, 5])
+           [2])
 
 
 def verify_projection(engine):
@@ -268,10 +284,12 @@ def verify_unsupported_fails_loud():
     print("\nVerifying unsupported predicates fail loudly...")
     # LIKE / ILIKE / BETWEEN are now implemented (verify_like_between); SIMILAR
     # TO and the % / MOD operator are still unsupported and must raise rather
-    # than silently match. IN with a *subquery* (as opposed to a value list) is
-    # likewise unsupported: it parses with an empty value list, so the old
-    # evaluator silently returned False for every row -- see
-    # verify_in_subquery_no_data_loss for the end-to-end data-loss angle.
+    # than silently match. IN with a *subquery* parses with an empty value
+    # list; the engine materializes uncorrelated subqueries before evaluation
+    # ever sees them (verify_sql_subqueries.py), but *direct* evaluation of an
+    # unmaterialized subquery -- this path bypasses the engine's rewrite --
+    # must keep failing loud, or the old silent table-wipe returns for any
+    # caller that skips the rewrite.
     cases = {
         "SIMILAR TO (predicate)": "SELECT * FROM t WHERE name SIMILAR TO 'A%'",
         "% / MOD (operand)": "SELECT * FROM t WHERE x = 10 % 3",

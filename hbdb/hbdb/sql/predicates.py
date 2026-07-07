@@ -15,8 +15,10 @@ silently deleting/updating/returning every row.
 
 Supported operators: =, !=/<>, <, <=, >, >=, AND, OR, NOT, parentheses,
 IS [NOT] NULL, IN, [NOT] BETWEEN, [NOT] LIKE / ILIKE (with ``%`` / ``_``
-wildcards and an optional ESCAPE character), and + - * / arithmetic on
-operands. NULLs follow SQL's three-valued logic: a comparison touching NULL is
+wildcards and an optional ESCAPE character), quantified comparisons
+(``<op> ANY / SOME / ALL`` over a value tuple the engine materialized from
+an uncorrelated subquery -- see ``subqueries.py``), and + - * / arithmetic
+on operands. NULLs follow SQL's three-valued logic: a comparison touching NULL is
 UNKNOWN and propagates through AND/OR/NOT; the top-level WHERE treats anything
 that is not definitely True as not-matched.
 
@@ -105,8 +107,49 @@ def _eval(node, row):
 
 
 def _eval_comparison(node, row):
+    if isinstance(node.right, (exp.Any, exp.All)):
+        return _eval_quantified(node, row)
     return _compare_op(_resolve(node.left, row), _resolve(node.right, row),
                        _COMPARATORS[type(node)])
+
+
+def _eval_quantified(node, row):
+    """``<op> ANY / SOME / ALL (v1, v2, ...)`` over a value tuple the engine
+    materialized from an uncorrelated subquery (see ``subqueries.py``).
+
+    SQL semantics: ANY is an OR-fold and ALL an AND-fold of the comparison
+    against each candidate, under three-valued logic -- so ANY is TRUE on the
+    first true comparison, FALSE only when every comparison is false, and
+    UNKNOWN when nothing was true but some comparison was UNKNOWN (a NULL
+    operand or candidate); ALL mirrors that. Over an *empty* set ANY is FALSE
+    and ALL is TRUE regardless of the left operand -- even a NULL one -- which
+    is why the fold below resolves the left operand first (fail-loud on an
+    unsupported expression) but never special-cases it.
+
+    Anything other than a materialized tuple (i.e. a subquery that did not go
+    through the engine's rewriter, or an unsupported ANY(array) form) fails
+    loud rather than guessing."""
+    quant = node.right
+    inner = quant.this
+    if not isinstance(inner, exp.Tuple):
+        raise NotImplementedError(
+            f"ANY/ALL requires a subquery materialized by the engine: "
+            f"{node.sql()}")
+    left = _resolve(node.left, row)
+    op = _COMPARATORS[type(node)]
+    is_any = isinstance(quant, exp.Any)
+    saw_unknown = False
+    for candidate in inner.expressions:
+        result = _compare_op(left, _resolve(candidate, row), op)
+        if result is None:
+            saw_unknown = True
+        elif result is True and is_any:
+            return True
+        elif result is False and not is_any:
+            return False
+    if saw_unknown:
+        return None
+    return False if is_any else True
 
 
 def _compare_op(left, right, op):
@@ -228,20 +271,32 @@ def _eval_is(node, row) -> bool:
 
 
 def _eval_in(node, row):
-    # Only a parenthesized value list (`x IN (1, 2, 3)`) is supported. A
-    # subquery or UNNEST (`x IN (SELECT ...)`, `x IN UNNEST(...)`) parses with
-    # an *empty* `expressions` list and the operand stashed under
-    # `query`/`unnest`/`field`. The old loop iterated that empty list and
-    # silently returned False for every row, so `x IN (SELECT ...)` matched
-    # nothing and -- the data-loss case -- `x NOT IN (SELECT ...)` matched
-    # *everything* (a DELETE/UPDATE with that predicate hit the whole table).
-    # Fail loud instead, exactly like the other unsupported subquery forms
-    # (a scalar `= (SELECT ...)`, EXISTS, `= ANY (...)`), so an unhandled
-    # construct can never be silently mis-evaluated.
+    # An IN whose subquery the engine materialized to an *empty* set (see
+    # subqueries.py): SQL defines `x IN (empty)` as FALSE -- and `x NOT IN
+    # (empty)` as TRUE -- even when x is NULL, so this short-circuit sits
+    # above the NULL check below. The left operand is still resolved first,
+    # keeping the fail-loud contract for an unsupported expression there.
+    if node.meta.get("materialized_empty_set"):
+        _resolve(node.this, row)
+        return False
+    # Otherwise only a parenthesized value list (`x IN (1, 2, 3)`) is
+    # supported here. An IN over a subquery or UNNEST (`x IN (SELECT ...)`,
+    # `x IN UNNEST(...)`) parses with an *empty* `expressions` list and the
+    # operand stashed under `query`/`unnest`/`field`; uncorrelated subqueries
+    # are rewritten to a value list by the engine before evaluation ever
+    # sees them (subqueries.py), so an empty list here means a form the
+    # engine does not support (a correlated subquery evaluated directly,
+    # UNNEST, ...). The old loop iterated that empty list and silently
+    # returned False for every row, so `x IN (SELECT ...)` matched nothing
+    # and -- the data-loss case -- `x NOT IN (SELECT ...)` matched
+    # *everything* (a DELETE/UPDATE with that predicate hit the whole
+    # table). Fail loud instead, so an unhandled construct can never be
+    # silently mis-evaluated.
     if not node.expressions:
         raise NotImplementedError(
-            f"IN requires a parenthesized value list; subqueries / UNNEST are "
-            f"not supported: {node.sql()}")
+            f"IN requires a parenthesized value list or a subquery "
+            f"materialized by the engine; this form is not supported: "
+            f"{node.sql()}")
     left = _resolve(node.this, row)
     if left is None:
         return None
