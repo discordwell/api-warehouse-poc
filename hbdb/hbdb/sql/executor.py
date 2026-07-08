@@ -7,7 +7,7 @@ from .plan import (LogicalNode, LogicalScan, LogicalFilter, LogicalProject,
                    LogicalAggregate, LogicalDistinct)
 from .encoding import KeyEncoder
 from .predicates import (evaluate as eval_predicate, resolve as resolve_operand,
-                         compare_values, distinct_key)
+                         compare_rows, distinct_key)
 from .aggregates import compute as compute_agg, substitute_aggs
 from ..core.proxy import Transaction
 from ..core.cache import get_read_cache
@@ -418,19 +418,10 @@ class SortExecutor(PhysicalOperator):
         return iter(rows)
 
     def _cmp(self, a: Dict[str, Any], b: Dict[str, Any]) -> int:
-        for expr, desc, nulls_first in self.keys:
-            av = resolve_operand(expr, a)
-            bv = resolve_operand(expr, b)
-            if av is None or bv is None:
-                if av is None and bv is None:
-                    continue
-                if av is None:
-                    return -1 if nulls_first else 1
-                return 1 if nulls_first else -1
-            c = compare_values(av, bv)
-            if c:
-                return -c if desc else c
-        return 0
+        # Each key is (expr, desc, nulls_first); resolve_operand evaluates the
+        # expression per row. Shared with set-operation ordering via
+        # predicates.compare_rows so the two orderings never diverge.
+        return compare_rows(a, b, self.keys, resolve_operand)
 
 
 class LimitExecutor(PhysicalOperator):

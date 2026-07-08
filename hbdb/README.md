@@ -170,6 +170,9 @@ python tests/verify_sql_aggregates.py
 python tests/verify_sql_join.py
 python tests/verify_sql_project.py
 python tests/verify_sql_functions.py
+python tests/verify_sql_case.py
+python tests/verify_sql_subqueries.py
+python tests/verify_sql_setops.py
 
 # Cluster integration (spawns local coordinator + storage subprocesses)
 python tests/verify_sharding.py
@@ -203,6 +206,8 @@ python examples/benchmark.py
 - Uncorrelated subqueries in any expression/predicate position: scalar
   `(SELECT ...)`, `[NOT] IN (SELECT ...)`, `[NOT] EXISTS (...)`, and
   quantified comparisons (`= ANY (...)`, `<> ALL (...)`, ...)
+- Set operations: `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` --
+  as statements, as subquery bodies, and as `INSERT ... SELECT` sources
 - `UPDATE` (with WHERE)
 - `DELETE` (with WHERE)
 
@@ -238,12 +243,38 @@ enclosing query's tables (or any column not in the subquery's own tables) —
 fails loud with `NotImplementedError` before executing: run standalone it
 would resolve the outer column to NULL and silently return wrong rows.
 
+Set operations (`hbdb/sql/setops.py`) are executed the same way -- by
+materialization: each side runs as its own SELECT inside the statement's
+transaction, rows are combined with SQL's set semantics, and the result
+carries the *first* side's output column names, with sides matched
+positionally (a column-count mismatch fails loud). The DISTINCT forms
+de-duplicate with the engine's value equality (`10` matches `"10"`, and
+NULLs are equal to each other for set purposes -- SQL's "not distinct"
+rule); `INTERSECT ALL` / `EXCEPT ALL` use bag semantics (each right-side
+occurrence consumes at most one left-side occurrence). Sides may be full
+SELECTs (joins, aggregates, subqueries, a parenthesized side's own
+ORDER BY/LIMIT), chains and parenthesized groups nest, and a set operation
+is accepted wherever a subquery body is (`IN`, `EXISTS`, scalar, `ANY`/`ALL`)
+and as an `INSERT ... SELECT` source. The whole statement may also be
+wrapped in parentheses -- `(a UNION b) ORDER BY c LIMIT n`, the standard way
+to sort/limit a set operation (and a plain `(SELECT ...)` is likewise a valid
+statement); such a wrapper parses as a subquery node, so the engine unwraps
+it and moves the trailing `ORDER BY`/`LIMIT`/`OFFSET` onto the combined
+result rather than mistaking it for a scalar subquery. An `ORDER BY` on the
+combined result may reference output columns only, by name or 1-based position
+(the standard's rule -- anything else fails loud), and `LIMIT`/`OFFSET` apply
+after combining. One deliberate rejection: sqlglot parses the bare chain
+`a UNION b INTERSECT c` left-to-right, but the SQL standard gives INTERSECT
+higher precedence, so executing the parsed shape would silently disagree
+with every mainstream engine -- that chain fails loud until parenthesized
+(`tests/verify_sql_setops.py`).
+
 `INSERT INTO t [(cols)] SELECT ...` materializes the source rows (in the
 same transaction) and maps the SELECT's output columns onto the target
 columns *positionally*, per SQL; a column-count mismatch fails loud. The
 source may be any supported SELECT (joins, aggregates, ORDER BY/LIMIT,
-subqueries), and `INSERT INTO t SELECT ... FROM t` reads its snapshot before
-writing, so a self-insert cannot chase its own rows.
+subqueries) or set operation, and `INSERT INTO t SELECT ... FROM t` reads
+its snapshot before writing, so a self-insert cannot chase its own rows.
 
 `SELECT col, ...` projects to the listed columns, `SELECT *` returns all, and
 `SELECT t.*` returns one table's columns; an aliased or computed item
@@ -328,7 +359,7 @@ than silently picking a side.
 
 Clauses the engine still does not implement — *correlated* subqueries,
 derived tables (`FROM (SELECT ...) t`), `WITH`/CTEs,
-`CREATE TABLE ... AS SELECT`, set operations (`UNION`/`INTERSECT`/`EXCEPT`),
+`CREATE TABLE ... AS SELECT`,
 window/analytic functions (`ROW_NUMBER() OVER (...)`), aggregates beyond the
 five above (`STDDEV`, ...), and scalar functions outside the set listed above
 (`SUBSTRING`, `REPLACE`, the `TRIM(... FROM ...)` forms, ...) — raise

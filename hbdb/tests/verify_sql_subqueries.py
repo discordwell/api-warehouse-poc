@@ -506,12 +506,18 @@ def verify_fail_loud_regressions(engine):
         lambda: engine.execute(
             "WITH c AS (SELECT 1 AS x FROM sq_fl_e) SELECT id FROM sq_fl_e"),
         NotImplementedError)
-    # Set-operation subquery bodies are unsupported -- loudly.
+    # Set-operation subquery bodies are now supported (verify_sql_setops.py
+    # covers them); an unsupported *side* of one (VALUES) must stay loud.
+    _check("UNION inside a subquery",
+           sorted(_ids(engine, "SELECT id FROM sq_fl_e WHERE id IN "
+                               "(SELECT id FROM sq_fl_e "
+                               "UNION SELECT id FROM sq_fl_e)")),
+           [1, 2, 3, 4, 5, 6])
     _expect_raises(
-        "UNION inside a subquery",
+        "VALUES as a set-operation side inside a subquery",
         lambda: engine.execute(
             "SELECT id FROM sq_fl_e WHERE id IN "
-            "(SELECT id FROM sq_fl_e UNION SELECT id FROM sq_fl_e)"),
+            "(SELECT id FROM sq_fl_e UNION VALUES (1))"),
         NotImplementedError)
 
 

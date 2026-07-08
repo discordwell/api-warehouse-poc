@@ -51,10 +51,12 @@ from .predicates import distinct_key
 def rewrite(statement, run_select, catalog):
     """Materialize every uncorrelated subquery in ``statement``, in place.
 
-    ``run_select(select_ast) -> (rows, output_columns)`` executes one SELECT
-    (the engine passes a closure bound to the current transaction; it also
-    re-enters this rewriter, which is what makes nested subqueries work --
-    each level is materialized just before the level above it runs).
+    ``run_select(query_ast) -> (rows, output_columns)`` executes one query
+    body -- a plain SELECT or a set-operation tree (UNION / INTERSECT /
+    EXCEPT), which is why a subquery body may be either. The engine passes a
+    closure bound to the current transaction; it also re-enters this
+    rewriter, which is what makes nested subqueries work -- each level is
+    materialized just before the level above it runs.
     """
     _walk(statement, run_select, catalog)
 
@@ -113,8 +115,12 @@ def _rewrite_exists(node, run_select, catalog):
     # Existence only needs one row. Cap the probe -- but never override an
     # explicit LIMIT: `EXISTS (SELECT ... LIMIT 0)` must stay empty/FALSE.
     # .limit() copies, so the original tree (used in error messages) is
-    # untouched.
-    probe = select if select.args.get("limit") else select.limit(1)
+    # untouched. A set-operation body runs in full: its LIMIT applies to the
+    # *combined* result, so capping a side could not be done blindly.
+    if isinstance(select, exp.Select) and not select.args.get("limit"):
+        probe = select.limit(1)
+    else:
+        probe = select
     rows, _ = run_select(probe)
     node.replace(exp.Boolean(this=bool(rows)))
 
@@ -152,14 +158,15 @@ def _rewrite_scalar(node, run_select, catalog):
 
 def _select_of(inner, context_node):
     """Unwrap ``Subquery(this=Select)`` (sqlglot wraps some positions, not
-    others) and require a plain SELECT -- a UNION/INTERSECT/EXCEPT body or
-    any other form fails loud."""
+    others) and require a query body the engine can run -- a plain SELECT or
+    a set-operation tree (UNION / INTERSECT / EXCEPT, executed by
+    ``setops.py``); any other form fails loud."""
     if isinstance(inner, exp.Subquery):
         inner = inner.this
-    if not isinstance(inner, exp.Select):
+    if not isinstance(inner, (exp.Select, exp.SetOperation)):
         raise NotImplementedError(
-            f"Unsupported subquery form (only a plain SELECT is supported): "
-            f"{context_node.sql()}")
+            f"Unsupported subquery form (only a SELECT or a set operation "
+            f"is supported): {context_node.sql()}")
     return inner
 
 
@@ -215,7 +222,8 @@ def _to_literal(value):
 
 def _check_uncorrelated(select, catalog):
     """Reject a subquery whose column references do not all resolve within
-    its own scope.
+    its own scope. A set-operation body is checked side by side -- each side
+    is its own scope (one side can never reference another's tables).
 
     The subquery's scope is the set of tables in its own FROM/JOIN clauses
     (by alias or name) plus its own SELECT aliases (so
@@ -226,6 +234,12 @@ def _check_uncorrelated(select, catalog):
     because executed standalone it would resolve to NULL and the subquery
     would silently return the wrong rows.
     """
+    if isinstance(select, exp.SetOperation):
+        _check_uncorrelated(_select_of(select.this, select.this), catalog)
+        _check_uncorrelated(_select_of(select.expression, select.expression),
+                            catalog)
+        return
+
     frm = select.args.get("from") or select.args.get("from_")
     if frm is not None and not isinstance(frm.this, exp.Table):
         raise NotImplementedError(

@@ -2,6 +2,52 @@
 
 ## Session Summaries (most recent first; keep 20)
 
+### 2026-07-08T05:51Z — hbdb/sql: set operations UNION/INTERSECT/EXCEPT (+ parenthesized-query fix, shared row comparator)
+Landed the in-progress **set-operations** feature and completed it end to end.
+- **Set ops by materialization** (new `hbdb/sql/setops.py`, `run_set_operation`).
+  Like subqueries, they run *above* bind/optimize: each side runs as its own
+  SELECT in the statement's txn, rows reduce to positional value tuples,
+  combine with SQL set semantics, and re-label with the **first** side's output
+  column names (positional matching; count mismatch fails loud). `UNION [ALL]`,
+  `INTERSECT [ALL]`, `EXCEPT [ALL]`; DISTINCT forms dedupe via `distinct_key`
+  (NULLs equal for set purposes; `10` == `"10"`), `*_ALL` use `Counter` bag
+  semantics. Sides recurse (chains, parenthesized groups), each side is a full
+  SELECT (joins/aggregates/subqueries/side ORDER BY+LIMIT). ORDER BY on the
+  combined result is output-columns-only (name/position, else fails loud);
+  LIMIT/OFFSET apply after combining. **Precedence guard:** sqlglot parses
+  `a UNION b INTERSECT c` left-to-right, but the standard binds INTERSECT
+  tighter — that bare chain fails loud until parenthesized (caught at top level
+  and via `_side` recursion). Set ops work as subquery bodies (IN/EXISTS/
+  scalar/ANY/ALL) and as `INSERT … SELECT` sources; correlated leaves stay loud.
+  Engine plumbing: `_run_query` dispatches SetOperation vs SELECT and is the
+  closure the subquery rewriter now uses (so a subquery body may be a set op);
+  `subqueries._check_uncorrelated` recurses per side; EXISTS probe runs a set-op
+  body in full (its LIMIT is on the combined result, can't cap a side).
+- **Fixed a real gap (this session):** a fully parenthesized top-level query —
+  `(a UNION b) ORDER BY c LIMIT n`, `(SELECT …)`, nested `((…))` — parses as a
+  `Subquery` *wrapper*, so the engine misrouted it to the scalar-subquery path
+  and reported a misleading "scalar subquery returned N rows". New
+  `engine._unwrap_parenthesized_query` unwraps it and moves the trailing
+  ORDER BY/LIMIT/OFFSET onto the body (fails loud on a wrapper-vs-body clash),
+  reused at both the top-level dispatch and the INSERT source. Standard SQL now
+  works instead of erroring.
+- **Dedup (review finding):** `setops` had its own copy of the ORDER BY row
+  comparator, a near-verbatim mirror of `SortExecutor._cmp` that had to stay
+  byte-for-byte in sync. Extracted `predicates.compare_rows(a,b,keys,get)` (an
+  accessor-parameterized comparator) and pointed both `SortExecutor._cmp` and
+  `setops._order_limit` at it, so ORDER BY NULL/coercion semantics live in one
+  place. (Left the parser's 3 sort-*key-binding* copies alone — different
+  concern, more invasive.)
+- **Tests/docs:** new `tests/verify_sql_setops.py` (UNION/INTERSECT/EXCEPT,
+  NULL/coercion identity, bag semantics, precedence, ORDER/LIMIT fail-loud,
+  subquery+INSERT positions, pure-Python parity, plus a
+  `verify_toplevel_parenthesized` block for the paren fix) wired into
+  `run_all.py`; `verify_sql_subqueries.py`'s old "UNION-in-subquery must raise"
+  flipped to a positive test + a narrower VALUES-side fail-loud. README SQL
+  section updated. Reviewed via 3 finder agents (0 correctness/regression
+  findings) + hands-on edge probing. Full suite **23/23** (incl. cluster). Pure
+  Python — no `.so` rebuild.
+
 ### 2026-07-02T03:55Z — hbdb/sql: uncorrelated subqueries, INSERT…SELECT (+ 3 silent-wrong fixes)
 The big missing SQL feature landed: **uncorrelated subqueries in every
 expression/predicate position**, plus `INSERT INTO … SELECT`, plus fixes for

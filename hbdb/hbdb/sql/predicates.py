@@ -428,6 +428,36 @@ def compare_values(a, b) -> int:
         return -1 if a < b else (1 if a > b else 0)
 
 
+def compare_rows(a, b, keys, get):
+    """Three-way compare (-1/0/1) two rows by an ORDER BY key list.
+
+    The single comparator shared by the streaming ORDER BY operator
+    (``executor.SortExecutor``) and set-operation ordering
+    (``setops._order_limit``), so the two can never drift on NULL placement or
+    coercion. ``keys`` is an iterable of ``(keyspec, desc, nulls_first)`` and
+    ``get(keyspec, row)`` resolves a key to that row's value -- the operand
+    resolver for the executor (keyspec is an expression), a bare column lookup
+    for set ops (keyspec is an output-column name). A NULL is placed by
+    ``nulls_first`` independent of ``desc`` (sqlglot already folds SQL's "NULL
+    is the smallest value" default and any explicit NULLS FIRST/LAST into it);
+    non-NULL values compare with ``compare_values`` and ``desc`` flips the
+    result.
+    """
+    for keyspec, desc, nulls_first in keys:
+        av = get(keyspec, a)
+        bv = get(keyspec, b)
+        if av is None or bv is None:
+            if av is None and bv is None:
+                continue
+            if av is None:
+                return -1 if nulls_first else 1
+            return 1 if nulls_first else -1
+        c = compare_values(av, bv)
+        if c:
+            return -c if desc else c
+    return 0
+
+
 def _as_number(value):
     if isinstance(value, bool):
         return None

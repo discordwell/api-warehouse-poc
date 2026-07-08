@@ -11,6 +11,7 @@ from .executor import build_physical_plan, ExecutionContext
 from .optimizer import Optimizer, StatsCollector
 from .plan import (LogicalCreateTable, LogicalCreateIndex, LogicalInsert,
                    output_columns)
+from .setops import run_set_operation
 from .subqueries import rewrite as rewrite_subqueries
 
 class SQLEngine:
@@ -68,22 +69,80 @@ class SQLEngine:
 
     def _execute_statement(self, ast: exp.Expression, txn: Transaction) -> List[Dict[str, Any]]:
         """Rewrite, bind, optimize and run one DML/query statement in ``txn``."""
+        # A fully parenthesized top-level query -- `(SELECT ...)` or
+        # `(a UNION b) ORDER BY c LIMIT n` -- parses as a Subquery *wrapper*,
+        # not the query itself; unwrap it so the dispatch below sees the real
+        # statement (otherwise the subquery rewriter grabs the wrapper as a
+        # scalar and reports a misleading "scalar subquery returned N rows").
+        ast = self._unwrap_parenthesized_query(ast)
+
+        # A set operation (UNION / INTERSECT / EXCEPT) combines whole query
+        # results; like INSERT ... SELECT below it is executed by the engine
+        # (setops.py), not bound as a single plan.
+        if isinstance(ast, exp.SetOperation):
+            rows, _ = self._run_query(ast, txn)
+            return rows
+
         # INSERT ... SELECT materializes its source rows, which no
         # bind-time-only path can do; handle it before binding.
         if isinstance(ast, exp.Insert) and isinstance(
-                ast.expression, (exp.Select, exp.Subquery, exp.Union)):
+                ast.expression, (exp.Select, exp.Subquery, exp.SetOperation)):
             return self._insert_from_select(ast, txn)
 
         # Materialize uncorrelated subqueries in place (each runs inside
         # this same transaction, so it sees the statement's snapshot), then
         # bind the rewritten tree through the unchanged pipeline.
-        rewrite_subqueries(ast, lambda sel: self._run_select(sel, txn),
+        rewrite_subqueries(ast, lambda q: self._run_query(q, txn),
                            self.catalog)
         logical_plan = self.parser.bind(ast)
         optimized_plan = self.optimizer.optimize(logical_plan)
         ctx = ExecutionContext(txn, getattr(self.db, "read_cache", None))
         plan = build_physical_plan(ctx, optimized_plan, self.catalog)
         return list(plan.next())
+
+    @staticmethod
+    def _unwrap_parenthesized_query(ast: exp.Expression) -> exp.Expression:
+        """Unwrap a top-level parenthesized query.
+
+        A statement wrapped entirely in parentheses -- ``(SELECT ...)``,
+        ``(a UNION b)``, or ``(a UNION b) ORDER BY c LIMIT n`` (the standard
+        way to sort/limit a whole set operation) -- parses as an
+        ``exp.Subquery`` whose ``.this`` is the real query body and whose own
+        args carry any trailing ORDER BY / LIMIT / OFFSET. Descend to that
+        body, moving those clauses onto it so the normal SELECT / set-operation
+        path applies them to the combined result. Nested parentheses
+        (``((a UNION b))``) unwrap layer by layer. A clause present on *both*
+        the parentheses and the inner body is genuinely ambiguous, so it fails
+        loud rather than silently dropping one.
+
+        Only the top-level statement is unwrapped here; a subquery in an
+        expression position is a value, not a statement, and is handled by the
+        subquery rewriter / set-operation side logic instead.
+        """
+        while isinstance(ast, exp.Subquery):
+            inner = ast.this
+            for arg in ("order", "limit", "offset"):
+                outer = ast.args.get(arg)
+                if outer is None:
+                    continue
+                if inner.args.get(arg) is not None:
+                    raise NotImplementedError(
+                        f"Conflicting {arg.upper()} on a parenthesized query "
+                        f"and its body: {ast.sql()}")
+                inner.set(arg, outer)
+            ast = inner
+        return ast
+
+    def _run_query(self, query_ast: exp.Expression, txn: Transaction
+                   ) -> Tuple[List[Dict[str, Any]], Optional[List[str]]]:
+        """Execute a query body -- a plain SELECT or a set-operation tree --
+        inside ``txn``; returns ``(rows, output_column_names)``. This is the
+        entry point the subquery rewriter uses, so a subquery body may be a
+        UNION/INTERSECT/EXCEPT as well as a SELECT."""
+        if isinstance(query_ast, exp.SetOperation):
+            return run_set_operation(
+                query_ast, lambda sel: self._run_select(sel, txn))
+        return self._run_select(query_ast, txn)
 
     def _run_select(self, select_ast: exp.Expression, txn: Transaction
                     ) -> Tuple[List[Dict[str, Any]], Optional[List[str]]]:
@@ -97,7 +156,7 @@ class SQLEngine:
         if not isinstance(select_ast, exp.Select):
             raise NotImplementedError(
                 f"Unsupported subquery statement: {select_ast.key}")
-        rewrite_subqueries(select_ast, lambda sel: self._run_select(sel, txn),
+        rewrite_subqueries(select_ast, lambda q: self._run_query(q, txn),
                            self.catalog)
         logical_plan = self.parser.bind(select_ast)
         optimized_plan = self.optimizer.optimize(logical_plan)
@@ -132,12 +191,15 @@ class SQLEngine:
                        else [c.name for c in table.schema.columns])
 
         source = ast.expression
-        select_ast = source.this if isinstance(source, exp.Subquery) else source
-        if not isinstance(select_ast, exp.Select):
+        # A parenthesized source -- `INSERT ... (SELECT ...)` or
+        # `INSERT ... ((a UNION b))` -- wraps the query in a Subquery; unwrap
+        # to the real body (the same normalization the top-level path uses).
+        select_ast = self._unwrap_parenthesized_query(source)
+        if not isinstance(select_ast, (exp.Select, exp.SetOperation)):
             raise NotImplementedError(
-                f"Unsupported INSERT source (only SELECT or VALUES): "
-                f"{source.sql()}")
-        rows, out_cols = self._run_select(select_ast, txn)
+                f"Unsupported INSERT source (only SELECT, a set operation, "
+                f"or VALUES): {source.sql()}")
+        rows, out_cols = self._run_query(select_ast, txn)
         if out_cols is None:
             raise NotImplementedError(
                 f"Cannot determine the SELECT's output column order for "

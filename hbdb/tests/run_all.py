@@ -51,6 +51,7 @@ VERIFY_SCRIPTS = [
     "verify_sql_functions.py",
     "verify_sql_case.py",
     "verify_sql_subqueries.py",
+    "verify_sql_setops.py",
 ]
 
 # Spawn local coordinator/storage subprocesses on ports 9000-9004

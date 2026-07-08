@@ -52,6 +52,14 @@ class SQLParser:
             return self._bind_delete(parsed)
         elif isinstance(parsed, exp.Create):
             return self._bind_create(parsed)
+        elif isinstance(parsed, exp.SetOperation):
+            # UNION / INTERSECT / EXCEPT combine whole query results, which
+            # takes a live transaction; the engine executes them via
+            # setops.py before binding. Reaching here means a direct
+            # parse() call -- fail with the real reason.
+            raise NotImplementedError(
+                "Set operations (UNION / INTERSECT / EXCEPT) are executed "
+                "by the engine and cannot be bound standalone")
         else:
             raise ValueError(f"Unsupported statement: {parsed.key}")
 
